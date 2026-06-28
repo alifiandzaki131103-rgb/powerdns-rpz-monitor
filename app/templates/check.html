@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% block title %}Domain Check - PowerDNS RPZ Monitor{% endblock %}
+
+{% block content %}
+<div class="section-header">🔍 Domain Checker</div>
+
+<div class="card" style="margin-bottom: 20px;">
+    <p style="color: var(--text-secondary); margin-bottom: 16px;">
+        Check apakah domain diblokir oleh RPZ. Query dikirim ke PowerDNS Recursor lokal.
+    </p>
+    <form method="POST" action="/check" class="check-form">
+        <input type="text" name="domain" class="check-input"
+               placeholder="contoh: example.com" 
+               value="{{ domain if domain else '' }}"
+               pattern="[a-zA-Z0-9._-]+" required
+               autofocus>
+        <button type="submit" class="btn">Check Domain</button>
+    </form>
+</div>
+
+{% if result %}
+<div class="result-card {{ 'blocked' if result.get('blocked') else 'safe' if not result.get('error') else '' }}">
+    <div class="result-header">
+        <div class="result-icon {{ 'blocked' if result.get('blocked') else 'safe' }}">
+            {% if result.get('error') %}
+                ⚠️
+            {% elif result.get('blocked') %}
+                🚫
+            {% else %}
+                ✅
+            {% endif %}
+        </div>
+        <div>
+            <div style="font-size: 18px; font-weight: 600;">
+                {% if result.get('error') %}
+                    Error: {{ result.error }}
+                {% elif result.get('blocked') %}
+                    {{ result.domain }} — <span style="color: var(--red);">BLOCKED</span>
+                {% else %}
+                    {{ result.domain }} — <span style="color: var(--green);">NOT BLOCKED</span>
+                {% endif %}
+            </div>
+            {% if result.get('rpz_action') %}
+            <div style="color: var(--text-secondary); font-size: 14px; margin-top: 4px;">
+                RPZ Action: <strong style="color: var(--orange);">{{ result.rpz_action }}</strong>
+            </div>
+            {% endif %}
+        </div>
+    </div>
+
+    {% if result.get('dig_output') %}
+    <details>
+        <summary style="cursor: pointer; color: var(--text-muted); font-size: 13px; margin-top: 8px;">
+            Show dig output
+        </summary>
+        <pre class="dig-output">{{ result.dig_output }}</pre>
+    </details>
+    {% endif %}
+</div>
+{% endif %}
+
+<!-- Quick test domains -->
+<div class="card" style="margin-top: 20px;">
+    <div class="card-label">Quick Test</div>
+    <div style="display: flex; gap: 8px; flex-wrap: wrap; margin-top: 8px;">
+        <form method="POST" action="/check" style="display:inline;">
+            <input type="hidden" name="domain" value="google.com">
+            <button type="submit" class="btn" style="background: var(--bg-primary); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px;">
+                google.com
+            </button>
+        </form>
+        <form method="POST" action="/check" style="display:inline;">
+            <input type="hidden" name="domain" value="facebook.com">
+            <button type="submit" class="btn" style="background: var(--bg-primary); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px;">
+                facebook.com
+            </button>
+        </form>
+        <form method="POST" action="/check" style="display:inline;">
+            <input type="hidden" name="domain" value="malware.testing.google.test">
+            <button type="submit" class="btn" style="background: var(--bg-primary); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px;">
+                malware.testing.google.test
+            </button>
+        </form>
+        <form method="POST" action="/check" style="display:inline;">
+            <input type="hidden" name="domain" value="blocked.example.rpz.local">
+            <button type="submit" class="btn" style="background: var(--bg-primary); border: 1px solid var(--border); font-size: 13px; padding: 6px 12px;">
+                blocked.example.rpz.local
+            </button>
+        </form>
+    </div>
+</div>
+{% endblock %}

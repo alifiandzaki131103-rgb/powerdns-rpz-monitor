@@ -1,0 +1,16 @@
+[Unit]
+Description=PowerDNS RPZ Monitor Web GUI
+After=network.target pdns-recursor.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/rpz-monitor
+ExecStart=/opt/rpz-monitor/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8050 --log-level info
+Restart=always
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+Environment=AUTH_USER=admin
+Environment=AUTH_PASS=13November*
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% block title %}CDN Analytics - PowerDNS RPZ Monitor{% endblock %}
+{% block content %}
+<style>
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px;flex-wrap:wrap}.header-row h1{font-size:28px}
+.range-buttons{display:flex;gap:8px;flex-wrap:wrap}.range-buttons a{color:var(--text-secondary);text-decoration:none;background:var(--bg-card);border:1px solid var(--border);padding:8px 12px;border-radius:var(--radius);font-size:14px}.range-buttons a.active,.range-buttons a:hover{background:var(--accent);color:white}
+.grid-2{display:grid;grid-template-columns:380px 1fr;gap:18px;margin-bottom:18px}
+.panel{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:18px}
+.panel h2{font-size:18px;margin-bottom:14px}
+.muted{color:var(--text-muted);font-size:13px}
+.chart-wrap{display:flex;flex-direction:column;align-items:center;gap:12px}
+.chart-wrap canvas{width:280px!important;height:280px!important}
+.legend{display:flex;flex-wrap:wrap;gap:6px 14px;justify-content:center}
+.legend-item{display:flex;align-items:center;gap:5px;font-size:12px;color:var(--text-secondary)}
+.legend-dot{width:10px;height:10px;border-radius:50%;flex-shrink:0}
+table{width:100%;border-collapse:collapse}th,td{padding:10px 8px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}th{color:var(--text-muted);font-size:12px;text-transform:uppercase;letter-spacing:.4px}tr:hover{background:rgba(255,255,255,.03)}
+.app-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}
+.num{text-align:right}
+.parse{margin-bottom:14px;color:var(--text-muted);font-size:13px}
+@media(max-width:900px){.grid-2{grid-template-columns:1fr}.chart-wrap canvas{width:240px!important;height:240px!important}}
+</style>
+<div class="header-row">
+  <h1>📊 CDN Analytics</h1>
+  <div class="range-buttons">
+    <a href="/cdn?range=1h" class="{{ 'active' if range == '1h' else '' }}">1 Jam</a>
+    <a href="/cdn?range=1d" class="{{ 'active' if range == '1d' else '' }}">1 Hari</a>
+    <a href="/cdn?range=7d" class="{{ 'active' if range == '7d' else '' }}">7 Hari</a>
+    <a href="/cdn?range=30d" class="{{ 'active' if range == '30d' else '' }}">30 Hari</a>
+  </div>
+</div>
+<div class="parse">Parsed {{ parse_stats.parsed }} lines, skipped {{ parse_stats.skipped }}, read {{ parse_stats.bytes }} bytes. Total range queries: {{ data.stats.total_queries }}.</div>
+<div class="grid-2">
+  <div class="panel">
+    <h2>🍩 Top Apps</h2>
+    <div class="chart-wrap">
+      <canvas id="appsChart" width="280" height="280"></canvas>
+      <div class="legend" id="chartLegend"></div>
+    </div>
+  </div>
+  <div class="panel">
+    <h2>📋 Top Apps</h2>
+    <table><thead><tr><th>#</th><th>App</th><th class="num">Queries</th><th class="num">%</th><th>Last Seen</th></tr></thead><tbody>
+    {% for app in data.apps %}
+      <tr><td>{{ loop.index }}</td><td><span class="app-dot" data-app="{{ app.app }}"></span>{{ app.app }}</td><td class="num">{{ app.queries }}</td><td class="num">{{ app.percentage }}%</td><td class="muted">{{ app.last_seen }}</td></tr>
+    {% else %}<tr><td colspan="5" class="muted">No data yet — parse running in background</td></tr>{% endfor %}
+    </tbody></table>
+  </div>
+</div>
+<div class="panel">
+  <h2>🔗 Top Domains</h2>
+  <table><thead><tr><th>#</th><th>App</th><th>Domain</th><th>Qtype</th><th class="num">Queries</th><th>Last Seen</th></tr></thead><tbody>
+  {% for d in data.domains %}
+    <tr><td>{{ loop.index }}</td><td><span class="app-dot" data-app="{{ d.app }}"></span>{{ d.app }}</td><td>{{ d.domain }}</td><td>{{ d.qtype }}</td><td class="num">{{ d.queries }}</td><td class="muted">{{ d.last_seen }}</td></tr>
+  {% else %}<tr><td colspan="6" class="muted">No data yet</td></tr>{% endfor %}
+  </tbody></table>
+</div>
+{% endblock %}
+{% block scripts %}
+var apps = {{ data.apps | tojson }};
+var colors = {"YouTube/Google":"#ff0000","TikTok":"#00f2ea","Facebook/Meta":"#1877f2","Netflix":"#e50914","Shopee":"#ee4d2d","Telegram":"#0088cc","Cloudflare":"#f38020","Akamai":"#0096d6","Apple":"#a2aaad","Microsoft":"#00a4ef","X/Twitter":"#1da1f2","Naver":"#03cf5d","Kwai/Kuaishou":"#ff6600","OPPO/Android":"#1a8c2f","Tokopedia":"#42b549","Grab":"#00b14f","Gojek":"#00aa13","Roblox":"#e2231a","LINE":"#00c300","Spotify":"#1db954","Video/CDN":"#9333ea","Other":"#64748b"};
+var getColor = function(name){ return colors[name] || "#64748b"; };
+
+document.querySelectorAll(".app-dot").forEach(function(el){ el.style.background = getColor(el.dataset.app); });
+
+function drawDonut(){
+  var c = document.getElementById("appsChart");
+  if(!c) return;
+  var ctx = c.getContext("2d");
+  var w = c.width, h = c.height;
+  var cx = w/2, cy = h/2, r = 120, inner = 60;
+  ctx.clearRect(0,0,w,h);
+  var total = apps.reduce(function(s,a){return s+a.queries;},0);
+  if(!total){ ctx.fillStyle="#94a3b8"; ctx.textAlign="center"; ctx.fillText("No data",cx,cy); return; }
+  var start = -Math.PI/2;
+  apps.forEach(function(a){
+    var slice = (a.queries/total)*Math.PI*2;
+    ctx.beginPath(); ctx.moveTo(cx,cy);
+    ctx.arc(cx,cy,r,start,start+slice);
+    ctx.closePath();
+    ctx.fillStyle = getColor(a.app);
+    ctx.fill();
+    start += slice;
+  });
+  ctx.globalCompositeOperation = "destination-out";
+  ctx.beginPath(); ctx.arc(cx,cy,inner,0,Math.PI*2); ctx.fill();
+  ctx.globalCompositeOperation = "source-over";
+  ctx.fillStyle = "#f1f5f9"; ctx.font = "700 22px sans-serif"; ctx.textAlign = "center";
+  ctx.fillText(total.toLocaleString(), cx, cy-2);
+  ctx.fillStyle = "#94a3b8"; ctx.font = "12px sans-serif";
+  ctx.fillText("queries", cx, cy+16);
+
+  // legend
+  var legend = document.getElementById("chartLegend");
+  if(legend){
+    legend.innerHTML = "";
+    apps.slice(0,20).forEach(function(a){
+      var pct = ((a.queries/total)*100).toFixed(1);
+      legend.innerHTML += '<span class="legend-item"><span class="legend-dot" style="background:'+getColor(a.app)+'"></span>'+a.app+' '+pct+'%</span>';
+    });
+  }
+}
+drawDonut();
+{% endblock %}

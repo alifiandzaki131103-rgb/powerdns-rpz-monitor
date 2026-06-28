@@ -1,0 +1,142 @@
+{% extends "base.html" %}
+{% block title %}Query Log - PowerDNS RPZ Monitor{% endblock %}
+
+{% block content %}
+<div class="section-header">📋 Query Log</div>
+
+<!-- Filter Bar -->
+<div class="card" style="margin-bottom: 16px;">
+    <form method="get" action="/logs" style="display: flex; gap: 12px; flex-wrap: wrap; align-items: flex-end;">
+        <div>
+            <label style="color: var(--text-muted); font-size: 12px; display: block;">Search Domain</label>
+            <input type="text" name="q" value="{{ search }}" placeholder="e.g. google.com"
+                style="background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary);
+                padding: 8px 12px; border-radius: 6px; width: 200px; font-size: 13px;">
+        </div>
+        <div>
+            <label style="color: var(--text-muted); font-size: 12px; display: block;">Client IP</label>
+            <input type="text" name="ip" value="{{ client_ip }}" placeholder="e.g. 192.168.1.1"
+                style="background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary);
+                padding: 8px 12px; border-radius: 6px; width: 160px; font-size: 13px;">
+        </div>
+        <div>
+            <label style="color: var(--text-muted); font-size: 12px; display: block;">Type</label>
+            <select name="type"
+                style="background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary);
+                padding: 8px 12px; border-radius: 6px; font-size: 13px;">
+                <option value="">All</option>
+                {% for t in ['A','AAAA','CNAME','MX','TXT','NS','PTR','SRV','ANY','CAA'] %}
+                <option value="{{ t }}" {% if qtype == t %}selected{% endif %}>{{ t }}</option>
+                {% endfor %}
+            </select>
+        </div>
+        <div>
+            <label style="color: var(--text-muted); font-size: 12px; display: block;">Lines</label>
+            <select name="limit"
+                style="background: var(--bg-primary); border: 1px solid var(--border); color: var(--text-primary);
+                padding: 8px 12px; border-radius: 6px; font-size: 13px;">
+                <option value="100" {% if limit == 100 %}selected{% endif %}>100</option>
+                <option value="500" {% if limit == 500 %}selected{% endif %}>500</option>
+                <option value="1000" {% if limit == 1000 %}selected{% endif %}>1000</option>
+                <option value="5000" {% if limit == 5000 %}selected{% endif %}>5000</option>
+            </select>
+        </div>
+        <button type="submit"
+            style="background: var(--accent); color: white; border: none; padding: 8px 20px;
+            border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: 600;">
+            🔍 Filter
+        </button>
+        <a href="/logs"
+            style="background: var(--bg-primary); color: var(--text-secondary); border: 1px solid var(--border);
+            padding: 8px 16px; border-radius: 6px; text-decoration: none; font-size: 13px;">
+            Reset
+        </a>
+    </form>
+</div>
+
+<!-- Stats -->
+<div class="card-grid" style="margin-bottom: 16px;">
+    <div class="card">
+        <div class="card-label">Total Queries (log)</div>
+        <div class="card-value blue">{{ "{:,}".format(total_lines) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Showing</div>
+        <div class="card-value green">{{ "{:,}".format(displayed) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Unique Domains</div>
+        <div class="card-value purple">{{ "{:,}".format(unique_domains) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Unique Clients</div>
+        <div class="card-value yellow">{{ "{:,}".format(unique_clients) }}</div>
+    </div>
+</div>
+
+<!-- Query Table -->
+<div class="table-wrap">
+    <div class="table-title">Recent Queries</div>
+    {% if logs %}
+    <div style="overflow-x: auto;">
+        <table>
+            <thead>
+                <tr>
+                    <th style="min-width: 140px;">Time</th>
+                    <th>Client</th>
+                    <th>Domain</th>
+                    <th style="text-align:center;">Type</th>
+                </tr>
+            </thead>
+            <tbody>
+                {% for row in logs %}
+                <tr>
+                    <td style="font-family: monospace; font-size: 12px; color: var(--text-muted);">{{ row.time }}</td>
+                    <td style="font-family: monospace; font-size: 12px;">{{ row.client }}</td>
+                    <td style="font-family: monospace; font-size: 12px; word-break: break-all;">
+                        {% if row.is_rpz %}
+                            <span style="color: #ef4444;">🚫 {{ row.domain }}</span>
+                        {% else %}
+                            {{ row.domain }}
+                        {% endif %}
+                    </td>
+                    <td style="text-align:center;">
+                        <span class="badge badge-{{ 'blue' if row.qtype == 'A' else 'purple' if row.qtype == 'AAAA' else 'yellow' if row.qtype == 'CNAME' else 'green' if row.qtype == 'MX' else '' }}">
+                            {{ row.qtype }}
+                        </span>
+                    </td>
+                </tr>
+                {% endfor %}
+            </tbody>
+        </table>
+    </div>
+    {% else %}
+    <p style="color: var(--text-secondary); text-align: center; padding: 24px;">
+        No queries found{% if search or client_ip or qtype %} matching filters{% endif %}.
+    </p>
+    {% endif %}
+</div>
+
+<!-- Auto-refresh -->
+<div style="text-align: center; margin-top: 12px;">
+    <label style="color: var(--text-muted); font-size: 12px;">
+        <input type="checkbox" id="autoRefresh" {% if auto_refresh %}checked{% endif %} onchange="toggleAutoRefresh()">
+        Auto-refresh (5s)
+    </label>
+</div>
+
+<script>
+let refreshTimer = null;
+function toggleAutoRefresh() {
+    if (document.getElementById('autoRefresh').checked) {
+        refreshTimer = setInterval(() => location.reload(), 5000);
+    } else {
+        clearInterval(refreshTimer);
+    }
+}
+// Start if checked
+if (document.getElementById('autoRefresh').checked) {
+    refreshTimer = setInterval(() => location.reload(), 5000);
+}
+</script>
+{% endblock %}

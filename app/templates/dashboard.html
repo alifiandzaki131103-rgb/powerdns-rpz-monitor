@@ -1,0 +1,184 @@
+{% extends "base.html" %}
+{% block title %}Dashboard - PowerDNS RPZ Monitor{% endblock %}
+
+{% block content %}
+<div class="section-header">📊 Dashboard</div>
+
+<!-- Status Cards -->
+<div class="card-grid">
+    <div class="card">
+        <div class="card-label">PowerDNS Status</div>
+        <div class="card-value {{ 'green' if pdns_status == 'active' else 'red' }}">
+            {{ pdns_status|upper }}
+        </div>
+        <div class="card-sub">Uptime: {{ uptime }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Queries/sec</div>
+        <div class="card-value blue" id="qps-val">{{ qps }}</div>
+        <div class="card-sub">Total: {{ "{:,}".format(total_queries) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Cache Hit Rate</div>
+        <div class="card-value {{ 'green' if cache_hit_rate > 50 else 'yellow' if cache_hit_rate > 20 else 'red' }}" id="cache-val">
+            {{ cache_hit_rate }}%
+        </div>
+        <div class="card-sub">Hits: {{ "{:,}".format(cache_hits) }} / Miss: {{ "{:,}".format(cache_misses) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">RPZ Rewrites</div>
+        <div class="card-value purple" id="rpz-val">{{ "{:,}".format(rpz_rewrites) }}</div>
+        <div class="card-sub">Domain blocks</div>
+    </div>
+</div>
+
+<!-- Response Codes -->
+<div class="card-grid">
+    <div class="card">
+        <div class="card-label">NOERROR</div>
+        <div class="card-value green">{{ "{:,}".format(noerror) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">NXDOMAIN</div>
+        <div class="card-value yellow">{{ "{:,}".format(nxdomain) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">SERVFAIL</div>
+        <div class="card-value red">{{ "{:,}".format(servfail) }}</div>
+    </div>
+</div>
+
+<!-- System Metrics -->
+<div class="card-grid">
+    <div class="card">
+        <div class="card-label">CPU Usage</div>
+        <div class="card-value" id="cpu-val">{{ system.cpu_percent }}%</div>
+        <div class="progress-bar">
+            <div class="progress-fill {{ 'green' if system.cpu_percent < 60 else 'yellow' if system.cpu_percent < 85 else 'red' }}"
+                 style="width: {{ system.cpu_percent }}%"></div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-label">Memory</div>
+        <div class="card-value" id="mem-val">{{ system.mem_percent }}%</div>
+        <div class="card-sub">{{ system.mem_used_gb }} / {{ system.mem_total_gb }} GB</div>
+        <div class="progress-bar">
+            <div class="progress-fill {{ 'green' if system.mem_percent < 60 else 'yellow' if system.mem_percent < 85 else 'red' }}"
+                 style="width: {{ system.mem_percent }}%"></div>
+        </div>
+    </div>
+    <div class="card">
+        <div class="card-label">Disk</div>
+        <div class="card-value" id="disk-val">{{ system.disk_percent }}%</div>
+        <div class="card-sub">{{ system.disk_used_gb }} / {{ system.disk_total_gb }} GB</div>
+        <div class="progress-bar">
+            <div class="progress-fill {{ 'green' if system.disk_percent < 60 else 'yellow' if system.disk_percent < 85 else 'red' }}"
+                 style="width: {{ system.disk_percent }}%"></div>
+        </div>
+    </div>
+</div>
+
+<!-- QPS Chart -->
+<div class="chart-wrap">
+    <div class="chart-title">Queries Per Second (last 30 min)</div>
+    <canvas id="qps-chart"></canvas>
+</div>
+{% endblock %}
+
+{% block scripts %}
+// Simple canvas chart
+const historyData = {{ stats_history }};
+const qpsData = historyData.qps || [];
+
+function drawChart(canvasId, data, color, label, maxPoints) {
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    const dpr = window.devicePixelRatio || 1;
+    const rect = canvas.getBoundingClientRect();
+    canvas.width = rect.width * dpr;
+    canvas.height = 200 * dpr;
+    ctx.scale(dpr, dpr);
+    
+    const w = rect.width;
+    const h = 200;
+    const pad = { top: 10, right: 10, bottom: 30, left: 50 };
+    const plotW = w - pad.left - pad.right;
+    const plotH = h - pad.top - pad.bottom;
+    
+    // Get last N points
+    const points = data.slice(-maxPoints);
+    if (points.length < 2) {
+        ctx.fillStyle = '#64748b';
+        ctx.font = '14px sans-serif';
+        ctx.textAlign = 'center';
+        ctx.fillText('Collecting data...', w/2, h/2);
+        return;
+    }
+    
+    const vals = points.map(p => p.val);
+    const maxVal = Math.max(...vals, 1);
+    
+    // Grid
+    ctx.strokeStyle = '#1e293b';
+    ctx.lineWidth = 1;
+    for (let i = 0; i <= 4; i++) {
+        const y = pad.top + (plotH / 4) * i;
+        ctx.beginPath();
+        ctx.moveTo(pad.left, y);
+        ctx.lineTo(w - pad.right, y);
+        ctx.stroke();
+        
+        ctx.fillStyle = '#64748b';
+        ctx.font = '11px sans-serif';
+        ctx.textAlign = 'right';
+        const val = (maxVal * (4 - i) / 4).toFixed(1);
+        ctx.fillText(val, pad.left - 8, y + 4);
+    }
+    
+    // Line
+    ctx.beginPath();
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    points.forEach((p, i) => {
+        const x = pad.left + (i / (points.length - 1)) * plotW;
+        const y = pad.top + plotH - (p.val / maxVal) * plotH;
+        if (i === 0) ctx.moveTo(x, y);
+        else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+    
+    // Fill
+    const lastX = pad.left + plotW;
+    const baseY = pad.top + plotH;
+    ctx.lineTo(lastX, baseY);
+    ctx.lineTo(pad.left, baseY);
+    ctx.closePath();
+    ctx.fillStyle = color.replace(')', ', 0.1)').replace('rgb', 'rgba');
+    ctx.fill();
+}
+
+drawChart('qps-chart', qpsData, 'rgb(59, 130, 246)', 'QPS', 360);
+
+// Auto-refresh stats every 5s
+setInterval(async () => {
+    try {
+        const res = await fetch('/api/stats');
+        const data = await res.json();
+        document.getElementById('qps-val').textContent = data.qps;
+        document.getElementById('rpz-val').textContent = data.rpz_rewrites.toLocaleString();
+        document.getElementById('cpu-val').textContent = data.system.cpu_percent + '%';
+        document.getElementById('mem-val').textContent = data.system.mem_percent + '%';
+        document.getElementById('disk-val').textContent = data.system.disk_percent + '%';
+    } catch(e) {}
+}, 5000);
+
+// Redraw chart every 10s
+setInterval(async () => {
+    try {
+        const res = await fetch('/api/history');
+        const data = await res.json();
+        drawChart('qps-chart', data.qps || [], 'rgb(59, 130, 246)', 'QPS', 360);
+    } catch(e) {}
+}, 10000);
+{% endblock %}

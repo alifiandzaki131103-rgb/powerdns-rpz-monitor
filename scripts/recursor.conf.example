@@ -1,0 +1,30 @@
+# PowerDNS Recursor - RPZ Monitor
+local-address=0.0.0.0
+local-port=53
+allow-from=0.0.0.0/0
+
+# Web API
+webserver=yes
+webserver-address=0.0.0.0
+webserver-port=8082
+webserver-allow-from=0.0.0.0/0
+webserver-password=admin123
+api-key=rpzmonitor2026
+
+# Lua config for RPZ
+lua-config-file=/etc/powerdns/recursor.lua
+
+# Performance
+threads=4
+max-cache-entries=1000000
+max-negative-ttl=3600
+max-cache-ttl=86400
+
+# Logging
+loglevel=4
+log-common-errors=yes
+log-rpz-changes=yes
+
+# Stats
+stats-ringbuffer-entries=50000
+lua-dns-script=/etc/powerdns/query-log.lua

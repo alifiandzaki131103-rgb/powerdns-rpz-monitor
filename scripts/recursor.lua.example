@@ -1,0 +1,7 @@
+dofile("/usr/share/pdns-recursor/lua-config/rootkeys.lua")
+
+-- Local RPZ zone (custom blocklist)
+rpzFile("/var/lib/powerdns/rpz-local.zone", { policyName = "rpz.local" })
+
+-- Komdigi trustpositifkominfo (loaded from zone file)
+rpzFile("/var/lib/powerdns/rpz-komdigi.zone", { policyName = "komdigi" })

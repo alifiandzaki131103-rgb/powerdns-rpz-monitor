@@ -1,0 +1,129 @@
+{% extends "base.html" %}
+{% block title %}RPZ Zones - PowerDNS RPZ Monitor{% endblock %}
+
+{% block content %}
+<div class="section-header">🛡️ RPZ Zones</div>
+
+<!-- Summary Cards -->
+<div class="card-grid">
+    <div class="card">
+        <div class="card-label">RPZ Zones Active</div>
+        <div class="card-value green">{{ rpz_data.active_count }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Total Records</div>
+        <div class="card-value blue">{{ "{:,}".format(rpz_data.total_records) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Total RPZ Hits</div>
+        <div class="card-value purple">{{ "{:,}".format(rpz_data.total_hits) }}</div>
+    </div>
+    <div class="card">
+        <div class="card-label">Custom Redirect</div>
+        <div class="card-value yellow">{{ "{:,}".format(rpz_data.policy_result_custom) }}</div>
+    </div>
+</div>
+
+<!-- RPZ Zone Details -->
+<div class="table-wrap">
+    <div class="table-title">RPZ Zone Status</div>
+    <table>
+        <thead>
+            <tr>
+                <th>Zone</th>
+                <th style="text-align:center;">Status</th>
+                <th>Source</th>
+                <th style="text-align:right;">Records</th>
+                <th style="text-align:right;">File Size</th>
+                <th style="text-align:right;">Hits</th>
+                <th>Last Modified</th>
+            </tr>
+        </thead>
+        <tbody>
+            {% for z in rpz_data.zones %}
+            <tr>
+                <td>
+                    <strong>{{ z.name }}</strong>
+                    <div style="color: var(--text-muted); font-size: 11px; margin-top: 2px;">policy: {{ z.policy_name }}</div>
+                </td>
+                <td style="text-align:center;">
+                    {% if z.status == 'active' %}
+                        <span class="badge badge-green">● Active</span>
+                    {% elif z.status == 'file not found' %}
+                        <span class="badge badge-red">✕ No File</span>
+                    {% else %}
+                        <span class="badge badge-yellow">⚠ {{ z.status }}</span>
+                    {% endif %}
+                </td>
+                <td style="color: var(--text-secondary); font-size: 13px;">{{ z.source }}</td>
+                <td style="text-align:right; font-family: monospace;">{{ "{:,}".format(z.record_count) }}</td>
+                <td style="text-align:right; font-family: monospace;">{{ z.file_size }}</td>
+                <td style="text-align:right; font-family: monospace;">{{ "{:,}".format(z.hits) }}</td>
+                <td style="color: var(--text-muted); font-size: 13px;">{{ z.last_modified }}</td>
+            </tr>
+            {% endfor %}
+        </tbody>
+    </table>
+</div>
+
+<!-- Sync Status -->
+<div class="card" style="margin-top: 16px;">
+    <div class="table-title">🔄 Auto-Sync Status</div>
+    <table>
+        <tr>
+            <td style="width: 160px; color: var(--text-muted);">Sync Script</td>
+            <td><code>/tmp/fetch-rpz.sh</code></td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Cron Schedule</td>
+            <td>03:00, 11:00, 19:00 WIB (3x/day)</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Retry</td>
+            <td>Max 20 attempts, 5s interval</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Last Sync Log</td>
+            <td style="font-family: monospace; font-size: 12px; color: var(--text-secondary);">{{ rpz_data.last_sync }}</td>
+        </tr>
+    </table>
+</div>
+
+<!-- Komdigi Info -->
+<div class="card" style="margin-top: 16px;">
+    <div class="table-title">📡 Komdigi TrustPositif RPZ</div>
+    <table>
+        <tr>
+            <td style="width: 160px; color: var(--text-muted);">Zone</td>
+            <td><code>trustpositifkominfo</code></td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Primary Server</td>
+            <td>139.255.196.202</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Secondary Server</td>
+            <td>182.23.79.202</td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Policy Action</td>
+            <td>CNAME → <code>lamanlabuh.aduankonten.id.</code></td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Block Method</td>
+            <td>AXFR → file-based <code>rpzFile()</code></td>
+        </tr>
+        <tr>
+            <td style="color: var(--text-muted);">Status</td>
+            <td>
+                {% if rpz_data.zones|length > 1 and rpz_data.zones[1].status == 'active' %}
+                    <span class="badge badge-green">● Synced & Active</span>
+                {% else %}
+                    <span class="badge badge-yellow">⚠ Not synced</span>
+                {% endif %}
+            </td>
+        </tr>
+    </table>
+</div>
+
+{% endblock %}
