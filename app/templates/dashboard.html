@@ -118,6 +118,7 @@ function drawChart(canvasId, data, color, label, maxPoints) {
     
     const vals = points.map(p => p.val);
     const maxVal = Math.max(...vals, 1);
+    const GAP_THRESHOLD = 90; // seconds - break line if gap > this
     
     // Grid
     ctx.strokeStyle = '#1e293b';
@@ -136,19 +137,42 @@ function drawChart(canvasId, data, color, label, maxPoints) {
         ctx.fillText(val, pad.left - 8, y + 4);
     }
     
-    // Line
-    ctx.beginPath();
+    // X-axis time labels
+    ctx.fillStyle = '#64748b';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    if (points.length > 1) {
+        const firstTs = points[0].ts;
+        const lastTs = points[points.length - 1].ts;
+        const fmtTs = (ts) => { const d = new Date(ts * 1000); return d.getHours().toString().padStart(2,'0') + ':' + d.getMinutes().toString().padStart(2,'0'); };
+        ctx.fillText(fmtTs(firstTs), pad.left, h - 6);
+        ctx.fillText(fmtTs(lastTs), w - pad.right, h - 6);
+        if (points.length > 10) {
+            const midTs = points[Math.floor(points.length / 2)].ts;
+            ctx.fillText(fmtTs(midTs), pad.left + plotW / 2, h - 6);
+        }
+    }
+    
+    // Line with gap breaks
     ctx.strokeStyle = color;
     ctx.lineWidth = 2;
+    let drawing = false;
     points.forEach((p, i) => {
         const x = pad.left + (i / (points.length - 1)) * plotW;
         const y = pad.top + plotH - (p.val / maxVal) * plotH;
-        if (i === 0) ctx.moveTo(x, y);
-        else ctx.lineTo(x, y);
+        const gap = i > 0 ? (p.ts - points[i-1].ts) : 0;
+        if (i === 0 || gap > GAP_THRESHOLD) {
+            ctx.stroke(); // finish previous segment
+            ctx.beginPath();
+            ctx.moveTo(x, y);
+            drawing = true;
+        } else {
+            ctx.lineTo(x, y);
+        }
     });
     ctx.stroke();
     
-    // Fill
+    // Fill - only last continuous segment
     const lastX = pad.left + plotW;
     const baseY = pad.top + plotH;
     ctx.lineTo(lastX, baseY);
