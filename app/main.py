@@ -137,6 +137,11 @@ async def lifespan(app: FastAPI):
                 except Exception as qe:
                     import traceback; traceback.print_exc()
                     print(f"qps collector error: {qe}", flush=True)
+                # CDN parse every other cycle (~60s)
+                try:
+                    parse_incremental(CDN_DB)
+                except Exception as ce:
+                    print(f"cdn parse error: {ce}", flush=True)
             except Exception as e:
                 print(f"resource collector error: {e}")
             try:
@@ -635,38 +640,26 @@ async def api_logs(request: Request, q: str = "", ip: str = "", type: str = "", 
 
 @app.get("/cdn", response_class=HTMLResponse)
 async def cdn_page(request: Request, range: str = "1d"):
-    global _cdn_last_parse, _cdn_parse_cache
     auth = await _require_auth(request)
     if auth:
         return auth
-    now = time.time()
-    if now - _cdn_last_parse > CDN_PARSE_COOLDOWN:
-        _cdn_parse_cache = parse_incremental(CDN_DB)
-        _cdn_last_parse = now
-    parse_stats = _cdn_parse_cache
     data = get_cdn_data(CDN_DB, range)
     return templates.TemplateResponse("cdn.html", {
         "request": request,
         "active_page": "cdn",
         "data": data,
-        "parse_stats": parse_stats,
+        "parse_stats": {},
         "range": range,
     })
 
 
 @app.get("/api/cdn")
 async def api_cdn(request: Request, range: str = "1d"):
-    global _cdn_last_parse, _cdn_parse_cache
     auth = await _require_auth(request)
     if auth:
         return auth
-    now = time.time()
-    if now - _cdn_last_parse > CDN_PARSE_COOLDOWN:
-        _cdn_parse_cache = parse_incremental(CDN_DB)
-        _cdn_last_parse = now
-    parse_stats = _cdn_parse_cache
     data = get_cdn_data(CDN_DB, range)
-    return {"parse": parse_stats, **data, "range": range}
+    return {**data, "range": range}
 
 
 # ============================================================
