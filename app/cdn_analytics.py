@@ -113,20 +113,23 @@ def parse_incremental(db_path=DB_PATH):
                     bucket = _bucket_5m(ts.strip())
                     app = _classify(domain)
                     key = (bucket, app, domain, qtype)
-                    aggregates[key] = aggregates.get(key, 0) + 1
+                    if key not in aggregates:
+                        aggregates[key] = [0, ts.strip()]
+                    aggregates[key][0] += 1
+                    aggregates[key][1] = ts.strip()
                     stats["parsed"] += 1
                 except Exception:
                     stats["skipped"] += 1
             new_offset = f.tell()
 
-        for (bucket, app, domain, qtype), count in aggregates.items():
+        for (bucket, app, domain, qtype), (count, last_ts) in aggregates.items():
             conn.execute("""
                 INSERT INTO cdn_queries (bucket, app, domain, qtype, count, last_seen)
                 VALUES (?, ?, ?, ?, ?, ?)
                 ON CONFLICT(bucket, app, domain, qtype) DO UPDATE SET
                     count = count + excluded.count,
-                    last_seen = excluded.last_seen
-            """, (bucket, app, domain, qtype, count, bucket))
+                    last_seen = CASE WHEN excluded.last_seen > last_seen THEN excluded.last_seen ELSE last_seen END
+            """, (bucket, app, domain, qtype, count, last_ts))
 
         cutoff = (datetime.now() - timedelta(days=RETENTION_DAYS)).strftime("%Y-%m-%d %H:%M:%S")
         conn.execute("DELETE FROM cdn_queries WHERE bucket < ?", (cutoff,))
