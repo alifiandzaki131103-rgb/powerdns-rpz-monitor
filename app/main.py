@@ -118,6 +118,25 @@ async def lifespan(app: FastAPI):
         while not stop_event.is_set():
             try:
                 collect_and_store(CDN_DB)
+                # Also collect QPS for dashboard chart
+                try:
+                    import time as _t
+                    stats = get_stats()
+                    qps_val = calc_qps(stats)
+                    now_ts = int(_t.time())
+                    cache_hits = int(stats.get("cache-hits", 0))
+                    cache_misses = int(stats.get("cache-misses", 0))
+                    total = cache_hits + cache_misses
+                    chr_val = round((cache_hits / total * 100) if total > 0 else 0, 1)
+                    stats_history["qps"].append({"ts": now_ts, "val": qps_val})
+                    stats_history["cache_hit_rate"].append({"ts": now_ts, "val": chr_val})
+                    if len(stats_history["qps"]) > MAX_HISTORY:
+                        stats_history["qps"] = stats_history["qps"][-MAX_HISTORY:]
+                        stats_history["cache_hit_rate"] = stats_history["cache_hit_rate"][-MAX_HISTORY:]
+                    print(f"[QPS] collected qps={qps_val} chr={chr_val} total_pts={len(stats_history['qps'])}", flush=True)
+                except Exception as qe:
+                    import traceback; traceback.print_exc()
+                    print(f"qps collector error: {qe}", flush=True)
             except Exception as e:
                 print(f"resource collector error: {e}")
             try:
