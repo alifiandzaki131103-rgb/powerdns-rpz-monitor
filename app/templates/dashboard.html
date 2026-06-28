@@ -87,7 +87,7 @@
 
 {% block scripts %}
 // Simple canvas chart
-const historyData = {{ stats_history }};
+const historyData = {{ stats_history | tojson }};
 const qpsData = historyData.qps || [];
 
 function drawChart(canvasId, data, color, label, maxPoints) {
