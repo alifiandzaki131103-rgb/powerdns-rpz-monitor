@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from app.query_log import read_query_log
 from app.cdn_analytics import init_cdn_db, parse_incremental, get_cdn_data
+import sqlite3 as _sqlite3
 from app.resources import init_resource_db, collect_and_store, get_resource_data, get_current_stats
 CDN_DB = "/opt/rpz-monitor/data/rpz-monitor.db"
 
@@ -74,6 +75,32 @@ _cdn_last_parse = 0  # timestamp of last CDN parse
 _cdn_parse_cache = {}  # cached parse stats
 CDN_PARSE_COOLDOWN = 60  # seconds between parses
 
+# QPS History SQLite persistence
+def _init_qps_db():
+    conn = _sqlite3.connect(CDN_DB)
+    conn.execute("""CREATE TABLE IF NOT EXISTS qps_history (
+        ts INTEGER PRIMARY KEY, qps REAL, cache_hit_rate REAL
+    )""")
+    conn.execute("CREATE INDEX IF NOT EXISTS idx_qps_ts ON qps_history(ts)")
+    conn.commit()
+    conn.close()
+
+def _store_qps(ts, qps_val, chr_val):
+    conn = _sqlite3.connect(CDN_DB)
+    conn.execute("INSERT OR REPLACE INTO qps_history (ts, qps, cache_hit_rate) VALUES (?, ?, ?)", (ts, qps_val, chr_val))
+    conn.execute("DELETE FROM qps_history WHERE ts < strftime('%s','now') - 3600")
+    conn.commit()
+    conn.close()
+
+def _read_qps_history(minutes=30):
+    conn = _sqlite3.connect(CDN_DB)
+    conn.row_factory = _sqlite3.Row
+    cutoff = int(__import__('time').time()) - (minutes * 60)
+    rows = conn.execute("SELECT ts, qps, cache_hit_rate FROM qps_history WHERE ts >= ? ORDER BY ts ASC", (cutoff,)).fetchall()
+    conn.close()
+    return {"qps": [{"ts": r["ts"], "val": r["qps"]} for r in rows],
+            "cache_hit_rate": [{"ts": r["ts"], "val": r["cache_hit_rate"]} for r in rows]}
+
 def _get_record_count(fpath):
     """Fast record count with mtime-based cache"""
     try:
@@ -111,6 +138,7 @@ async def _require_auth(request: Request):
 async def lifespan(app: FastAPI):
     init_cdn_db(CDN_DB)
     init_resource_db(CDN_DB)
+    _init_qps_db()
     collect_and_store(CDN_DB)
     stop_event = asyncio.Event()
 
@@ -128,12 +156,8 @@ async def lifespan(app: FastAPI):
                     cache_misses = int(stats.get("cache-misses", 0))
                     total = cache_hits + cache_misses
                     chr_val = round((cache_hits / total * 100) if total > 0 else 0, 1)
-                    stats_history["qps"].append({"ts": now_ts, "val": qps_val})
-                    stats_history["cache_hit_rate"].append({"ts": now_ts, "val": chr_val})
-                    if len(stats_history["qps"]) > MAX_HISTORY:
-                        stats_history["qps"] = stats_history["qps"][-MAX_HISTORY:]
-                        stats_history["cache_hit_rate"] = stats_history["cache_hit_rate"][-MAX_HISTORY:]
-                    print(f"[QPS] collected qps={qps_val} chr={chr_val} total_pts={len(stats_history['qps'])}", flush=True)
+                    _store_qps(now_ts, qps_val, chr_val)
+                    print(f"[QPS] collected qps={qps_val} chr={chr_val} ok", flush=True)
                 except Exception as qe:
                     import traceback; traceback.print_exc()
                     print(f"qps collector error: {qe}", flush=True)
@@ -481,13 +505,6 @@ async def dashboard(request: Request):
     cache_hit_rate = round((cache_hits / total * 100) if total > 0 else 0, 1)
     rpz_rewrites = int(stats.get("policy-hits", 0))
 
-    now_ts = int(time.time())
-    stats_history["qps"].append({"ts": now_ts, "val": qps})
-    stats_history["cache_hit_rate"].append({"ts": now_ts, "val": cache_hit_rate})
-    if len(stats_history["qps"]) > MAX_HISTORY:
-        stats_history["qps"] = stats_history["qps"][-MAX_HISTORY:]
-        stats_history["cache_hit_rate"] = stats_history["cache_hit_rate"][-MAX_HISTORY:]
-
     return templates.TemplateResponse("dashboard.html", {
         "request": request,
         "pdns_status": pdns_status,
@@ -502,7 +519,7 @@ async def dashboard(request: Request):
         "noerror": int(stats.get("noerror-answers", 0)),
         "servfail": int(stats.get("servfail-answers", 0)),
         "system": system,
-        "stats_history": json.dumps(stats_history),
+        "stats_history": json.dumps(_read_qps_history(30)),
         "active_page": "dashboard",
     })
 
@@ -578,7 +595,7 @@ async def api_history(request: Request):
     auth = await _require_auth(request)
     if auth:
         return auth
-    return stats_history
+    return _read_qps_history(30)
 
 
 @app.post("/api/check")
