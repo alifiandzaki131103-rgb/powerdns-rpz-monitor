@@ -55,7 +55,7 @@ Konfigurasi `/etc/powerdns/recursor.conf`:
 ```ini
 local-address=0.0.0.0
 local-port=53
-allow-from=0.0.0.0/0
+allow-from=127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10, 103.55.252.0/23
 
 # Web API
 webserver=yes
