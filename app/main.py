@@ -24,13 +24,13 @@ CDN_DB = "/opt/rpz-monitor/data/rpz-monitor.db"
 
 # Config
 PDNS_API_URL = os.getenv("PDNS_API_URL", "http://127.0.0.1:8082")
-PDNS_API_KEY = os.getenv("PDNS_API_KEY", "YOUR_API_KEY_HERE")
+PDNS_API_KEY = os.getenv("PDNS_API_KEY", "rpzmonitor2026")
 APP_TZ = os.getenv("APP_TZ", "Asia/Jakarta")
 APP_PORT = int(os.getenv("APP_PORT", "8050"))
 
 # Auth config
 AUTH_USER = os.getenv("AUTH_USER", "admin")
-AUTH_PASS = os.getenv("AUTH_PASS", "change-me")
+AUTH_PASS = os.getenv("AUTH_PASS", "admin123")
 SESSION_SECRET = os.getenv("SESSION_SECRET", secrets.token_hex(32))
 SESSION_MAX_AGE = 86400  # 24h
 
@@ -68,6 +68,9 @@ def _verify_session(token: str) -> bool:
 _valid_sessions: set = set()
 # RPZ record count cache
 _rpz_record_cache = {}  # {filepath: (mtime, count)}
+_cdn_last_parse = 0  # timestamp of last CDN parse
+_cdn_parse_cache = {}  # cached parse stats
+CDN_PARSE_COOLDOWN = 60  # seconds between parses
 
 def _get_record_count(fpath):
     """Fast record count with mtime-based cache"""
@@ -587,10 +590,15 @@ async def api_logs(request: Request, q: str = "", ip: str = "", type: str = "", 
 
 @app.get("/cdn", response_class=HTMLResponse)
 async def cdn_page(request: Request, range: str = "1d"):
+    global _cdn_last_parse, _cdn_parse_cache
     auth = await _require_auth(request)
     if auth:
         return auth
-    parse_stats = parse_incremental(CDN_DB)
+    now = time.time()
+    if now - _cdn_last_parse > CDN_PARSE_COOLDOWN:
+        _cdn_parse_cache = parse_incremental(CDN_DB)
+        _cdn_last_parse = now
+    parse_stats = _cdn_parse_cache
     data = get_cdn_data(CDN_DB, range)
     return templates.TemplateResponse("cdn.html", {
         "request": request,
@@ -603,10 +611,15 @@ async def cdn_page(request: Request, range: str = "1d"):
 
 @app.get("/api/cdn")
 async def api_cdn(request: Request, range: str = "1d"):
+    global _cdn_last_parse, _cdn_parse_cache
     auth = await _require_auth(request)
     if auth:
         return auth
-    parse_stats = parse_incremental(CDN_DB)
+    now = time.time()
+    if now - _cdn_last_parse > CDN_PARSE_COOLDOWN:
+        _cdn_parse_cache = parse_incremental(CDN_DB)
+        _cdn_last_parse = now
+    parse_stats = _cdn_parse_cache
     data = get_cdn_data(CDN_DB, range)
     return {"parse": parse_stats, **data, "range": range}
 
