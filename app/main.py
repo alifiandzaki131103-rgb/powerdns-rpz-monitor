@@ -8,6 +8,7 @@ import hashlib
 import hmac
 import secrets
 import glob
+import asyncio
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -20,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from app.query_log import read_query_log
 from app.cdn_analytics import init_cdn_db, parse_incremental, get_cdn_data
+from app.resources import init_resource_db, collect_and_store, get_resource_data, get_current_stats
 CDN_DB = "/opt/rpz-monitor/data/rpz-monitor.db"
 
 # Config
@@ -108,7 +110,31 @@ async def _require_auth(request: Request):
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_cdn_db(CDN_DB)
-    yield
+    init_resource_db(CDN_DB)
+    collect_and_store(CDN_DB)
+    stop_event = asyncio.Event()
+
+    async def resource_collector():
+        while not stop_event.is_set():
+            try:
+                collect_and_store(CDN_DB)
+            except Exception as e:
+                print(f"resource collector error: {e}")
+            try:
+                await asyncio.wait_for(stop_event.wait(), timeout=30)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(resource_collector())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
 app = FastAPI(title="PowerDNS RPZ Monitor", lifespan=lifespan)
 app.mount("/static", StaticFiles(directory="/opt/rpz-monitor/app/static"), name="static")
@@ -622,6 +648,38 @@ async def api_cdn(request: Request, range: str = "1d"):
     parse_stats = _cdn_parse_cache
     data = get_cdn_data(CDN_DB, range)
     return {"parse": parse_stats, **data, "range": range}
+
+
+# ============================================================
+# RESOURCE MONITOR ROUTES
+# ============================================================
+
+@app.get("/resources", response_class=HTMLResponse)
+async def resources_page(request: Request, range: str = "1h"):
+    auth = await _require_auth(request)
+    if auth:
+        return auth
+    if range not in ("1h", "6h", "1d", "7d"):
+        range = "1h"
+    data = get_resource_data(CDN_DB, range)
+    current = get_current_stats()
+    return templates.TemplateResponse("resources.html", {
+        "request": request,
+        "active_page": "resources",
+        "data": data,
+        "current": current,
+        "range": range,
+    })
+
+
+@app.get("/api/resources")
+async def api_resources(request: Request, range: str = "1h"):
+    auth = await _require_auth(request)
+    if auth:
+        return auth
+    if range not in ("1h", "6h", "1d", "7d"):
+        range = "1h"
+    return {"range": range, "current": get_current_stats(), **get_resource_data(CDN_DB, range)}
 
 
 if __name__ == "__main__":

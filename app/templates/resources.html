@@ -1,0 +1,65 @@
+{% extends "base.html" %}
+{% set active_page = "resources" %}
+{% block title %}Resource Monitor - PowerDNS RPZ Monitor{% endblock %}
+{% block content %}
+<style>
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px;flex-wrap:wrap}.header-row h1{font-size:28px}
+.range-buttons{display:flex;gap:8px;flex-wrap:wrap}.range-buttons a{color:var(--text-secondary);text-decoration:none;background:var(--bg-card);border:1px solid var(--border);padding:8px 12px;border-radius:var(--radius);font-size:14px}.range-buttons a.active,.range-buttons a:hover{background:var(--accent);color:white}
+.grid-2{display:grid;grid-template-columns:1fr 1fr;gap:18px;margin-bottom:18px}.panel{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:18px}.panel h2{font-size:18px;margin-bottom:14px}.muted{color:var(--text-muted);font-size:13px}.num{text-align:right}.small{font-size:13px;color:var(--text-secondary)}
+.chart-canvas{width:100%!important;height:220px!important;background:#1a1a2e;border-radius:8px}.legend{display:flex;gap:12px;flex-wrap:wrap;margin-top:10px}.legend-item{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--text-secondary)}.legend-dot{width:10px;height:10px;border-radius:50%}
+@media(max-width:900px){.grid-2{grid-template-columns:1fr}}
+</style>
+<div class="header-row">
+  <h1>🖥️ Resource Monitor</h1>
+  <div class="range-buttons">
+    <a href="/resources?range=1h" class="{{ 'active' if range == '1h' else '' }}">1h</a>
+    <a href="/resources?range=6h" class="{{ 'active' if range == '6h' else '' }}">6h</a>
+    <a href="/resources?range=1d" class="{{ 'active' if range == '1d' else '' }}">1d</a>
+    <a href="/resources?range=7d" class="{{ 'active' if range == '7d' else '' }}">7d</a>
+  </div>
+</div>
+<div class="card-grid">
+  {% set cpu_class = 'green' if current.cpu_percent < 60 else ('yellow' if current.cpu_percent < 80 else 'red') %}
+  {% set ram_class = 'green' if current.ram_percent < 60 else ('yellow' if current.ram_percent < 80 else 'red') %}
+  {% set disk_class = 'green' if current.disk_percent < 60 else ('yellow' if current.disk_percent < 80 else 'red') %}
+  <div class="card"><div class="card-label">CPU</div><div class="card-value {{ cpu_class }}">{{ '%.1f'|format(current.cpu_percent) }}%</div><div class="card-sub">{{ current.cpu_per_core|length }} cores</div></div>
+  <div class="card"><div class="card-label">RAM</div><div class="card-value {{ ram_class }}">{{ '%.1f'|format(current.ram_percent) }}%</div><div class="card-sub">{{ '%.0f'|format(current.ram_used_mb) }} / {{ '%.0f'|format(current.ram_total_mb) }} MB</div></div>
+  <div class="card"><div class="card-label">Disk /</div><div class="card-value {{ disk_class }}">{{ '%.1f'|format(current.disk_percent) }}%</div><div class="card-sub">{{ '%.1f'|format(current.disk_used_gb) }} / {{ '%.1f'|format(current.disk_total_gb) }} GB</div></div>
+  <div class="card"><div class="card-label">PowerDNS RSS</div><div class="card-value green">{{ '%.0f'|format(current.pdns.rss_mb) }} MB</div><div class="card-sub">PID {{ current.pdns.pid or 'N/A' }}</div></div>
+</div>
+<div class="grid-2">
+  <div class="panel"><h2>CPU Usage</h2><canvas id="cpuChart" class="chart-canvas"></canvas></div>
+  <div class="panel"><h2>RAM Usage</h2><canvas id="ramChart" class="chart-canvas"></canvas></div>
+  <div class="panel"><h2>System Load</h2><canvas id="loadChart" class="chart-canvas"></canvas><div class="legend"><span class="legend-item"><span class="legend-dot" style="background:#ffd93d"></span>1m</span><span class="legend-item"><span class="legend-dot" style="background:#00d4ff"></span>5m</span><span class="legend-item"><span class="legend-dot" style="background:#ff6b6b"></span>15m</span></div></div>
+  <div class="panel"><h2>PowerDNS RSS</h2><canvas id="pdnsChart" class="chart-canvas"></canvas></div>
+</div>
+<div class="table-wrap"><div class="table-title">Current Stats <span class="muted">{{ current.timestamp }}</span></div><table><tbody>
+<tr><th>PowerDNS PID</th><td>{{ current.pdns.pid or 'N/A' }}</td><th>PowerDNS Uptime</th><td>{{ current.pdns.uptime }}</td></tr>
+<tr><th>Threads</th><td>{{ current.pdns.threads }}</td><th>Open FDs</th><td>{{ current.pdns.fds }}</td></tr>
+<tr><th>System Uptime</th><td>{{ current.system_uptime }}</td><th>Load Average</th><td>{{ current.load_1 }} / {{ current.load_5 }} / {{ current.load_15 }}</td></tr>
+<tr><th>Network Sent</th><td>{{ '%.1f'|format(current.net_sent_mb) }} MB</td><th>Network Received</th><td>{{ '%.1f'|format(current.net_recv_mb) }} MB</td></tr>
+</tbody></table></div>
+{% endblock %}
+{% block scripts %}
+var series = {{ data | tojson }};
+function drawLineChart(id, lines, opts){
+  var c=document.getElementById(id), ctx=c.getContext('2d'), rect=c.getBoundingClientRect(), dpr=window.devicePixelRatio||1;
+  c.width=rect.width*dpr; c.height=220*dpr; ctx.scale(dpr,dpr);
+  var w=rect.width,h=220,p=34; ctx.fillStyle='#1a1a2e'; ctx.fillRect(0,0,w,h);
+  var vals=[]; lines.forEach(function(l){ vals=vals.concat(l.data.filter(function(v){return v!==null && !isNaN(v);})); });
+  if(!vals.length){ ctx.fillStyle='#94a3b8'; ctx.textAlign='center'; ctx.fillText('No data yet',w/2,h/2); return; }
+  var min=opts.min!==undefined?opts.min:Math.min.apply(null,vals), max=opts.max!==undefined?opts.max:Math.max.apply(null,vals);
+  if(max===min){ max=min+1; } if(opts.min===undefined){ min=Math.max(0,min-(max-min)*0.1); } if(opts.max===undefined){ max=max+(max-min)*0.15; }
+  ctx.strokeStyle='#333'; ctx.lineWidth=1; ctx.fillStyle='#94a3b8'; ctx.font='11px sans-serif'; ctx.textAlign='right';
+  for(var i=0;i<=4;i++){ var y=p+(h-2*p)*i/4; var v=max-(max-min)*i/4; ctx.beginPath(); ctx.moveTo(p,y); ctx.lineTo(w-p,y); ctx.stroke(); ctx.fillText(v.toFixed(1),p-6,y+4); }
+  lines.forEach(function(l){ ctx.strokeStyle=l.color; ctx.lineWidth=2; ctx.beginPath(); l.data.forEach(function(v,i){ var x=p+(w-2*p)*(l.data.length<=1?0:i/(l.data.length-1)); var y=p+(h-2*p)*(1-(v-min)/(max-min)); if(i===0) ctx.moveTo(x,y); else ctx.lineTo(x,y); }); ctx.stroke(); });
+  ctx.fillStyle='#94a3b8'; ctx.textAlign='center'; var labels=series.timestamps; if(labels.length){ ctx.fillText(labels[0],p,h-8); ctx.fillText(labels[labels.length-1],w-p,h-8); }
+}
+function drawAll(){
+  drawLineChart('cpuChart',[{data:series.cpu,color:'#00d4ff'}],{min:0,max:100});
+  drawLineChart('ramChart',[{data:series.ram_percent,color:'#ff6b6b'}],{min:0,max:100});
+  drawLineChart('loadChart',[{data:series.load_1,color:'#ffd93d'},{data:series.load_5,color:'#00d4ff'},{data:series.load_15,color:'#ff6b6b'}],{});
+  drawLineChart('pdnsChart',[{data:series.pdns_rss,color:'#6bcb77'}],{});
+}
+window.addEventListener('resize', drawAll); drawAll();
+{% endblock %}
