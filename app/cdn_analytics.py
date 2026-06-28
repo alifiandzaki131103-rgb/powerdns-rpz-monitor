@@ -5,7 +5,7 @@ from datetime import datetime, timedelta
 
 DB_PATH = "/opt/rpz-monitor/data/rpz-monitor.db"
 LOG_PATH = "/var/log/pdns-query.log"
-MAX_BYTES = 5 * 1024 * 1024
+MAX_BYTES = 20 * 1024 * 1024
 RETENTION_DAYS = 30
 
 CDN_PATTERNS = {
