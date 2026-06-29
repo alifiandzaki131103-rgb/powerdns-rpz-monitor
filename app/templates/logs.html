@@ -134,6 +134,8 @@ function toggleAutoRefresh() {
         clearInterval(refreshTimer);
     }
 }
+// Clear timer on navigation to prevent race condition
+window.addEventListener('beforeunload', () => { clearInterval(refreshTimer); });
 // Start if checked
 if (document.getElementById('autoRefresh').checked) {
     refreshTimer = setInterval(() => location.reload(), 5000);
