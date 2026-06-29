@@ -13,6 +13,7 @@ Web GUI monitoring untuk PowerDNS Recursor dengan RPZ (Response Policy Zone) Kom
 - 🔍 **Domain Check** — cek apakah domain masuk RPZ blocklist
 - 📋 **Query Log** — live query log dengan filter (domain, client IP, tipe)
 - 📈 **CDN Analytics** — analisis traffic per app/CDN (TikTok, YouTube, Facebook, Shopee, dll) dari query log
+- 🖥️ **Resource Monitor** — CPU, RAM, disk, PowerDNS RSS, system load real-time
 
 ## Screenshot
 
@@ -23,8 +24,8 @@ Web GUI monitoring untuk PowerDNS Recursor dengan RPZ (Response Policy Zone) Kom
 ## Stack
 
 - **Backend**: FastAPI + Jinja2 + SQLite + Uvicorn
-- **DNS**: PowerDNS Recursor 4.9.x + Lua RPZ
-- **RPZ Source**: Komdigi TrustPositif (AXFR zone transfer)
+- **DNS**: PowerDNS Recursor 4.9.x + Lua RPZ + forward-zones-recurse (Google/Cloudflare fallback)
+- **RPZ Source**: Komdigi TrustPositif (rpzFile, loaded from zone file)
 - **Reverse Proxy**: Nginx
 
 ## Prerequisites
@@ -72,9 +73,19 @@ lua-dns-script=/etc/powerdns/query-log.lua
 # Performance
 threads=4
 max-cache-entries=1000000
+max-negative-ttl=3600
+max-cache-ttl=86400
 
 # Stats
 stats-ringbuffer-entries=50000
+
+# Network tuning - reduce outgoing timeouts
+network-timeout=3000
+
+# Fallback forwarders - reduce SERVFAIL & latency
+# Uses forward-zones-recurse so DNSSEC validation still applies
+# RPZ policies are checked locally BEFORE forwarding
+forward-zones-recurse=.=8.8.8.8;1.1.1.1;8.8.4.4;1.0.0.1
 ```
 
 **⚠️ Pitfalls:**
@@ -98,19 +109,62 @@ rpzFile("/var/lib/powerdns/rpz-komdigi.zone", { policyName = "komdigi" })
 - `rpzFile()` second arg HARUS options table `{}`, bukan bare string
 - `rpzMaster()` deprecated, pakai `rpzPrimary()`
 - Hooks (preresolve) HARUS di `lua-dns-script`, BUKAN `lua-config-file`
+- Query log JANGAN pakai `io.open()` + `io.close()` setiap query (60x/detik = bottleneck). Pakai persistent fd + batch flush
+- JANGAN pakai `os.execute()` di preresolve untuk log rotation (fork shell di hot path). Pakai `os.rename()` atomic rotate
+- `forward-zones-recurse` (bukan `forward-zones`) supaya DNSSEC tetap validate
 
-Query logging `/etc/powerdns/query-log.lua`:
+Query logging `/etc/powerdns/query-log.lua` (optimized — persistent file handle, batch flush):
 
 ```lua
-function preresolve(dq)
-    local f = io.open("/var/log/pdns-query.log", "a")
-    if f then
-        f:write(os.date("%Y-%m-%d %H:%M:%S") .. "|" ..
-                dq.remoteaddr:toString() .. "|" ..
-                dq.qname:toString() .. "|" ..
-                dns.qtype.tostring(dq.qtype) .. "\n")
-        f:close()
+-- Optimized query logger
+-- Persistent file handle + batch flush, no os.execute fork
+-- See scripts/query-log.lua for full version
+
+local log_fd = nil
+local write_buf = {}
+local BUF_SIZE = 50
+local MAX_LINES = 200000
+local line_count = 0
+
+local qtype_map = {
+    [1]="A",[28]="AAAA",[5]="CNAME",[15]="MX",
+    [16]="TXT",[2]="NS",[6]="SOA",[12]="PTR",
+    [33]="SRV",[255]="ANY",[257]="CAA",
+}
+
+local function get_fd()
+    if not log_fd then
+        log_fd = io.open("/var/log/pdns-query.log", "a")
     end
+    return log_fd
+end
+
+function preresolve(dq)
+    local qt = tonumber(dq.qtype)
+    local qts = qtype_map[qt] or tostring(qt)
+    local line = os.date("%Y-%m-%d %H:%M:%S") .. "|"
+                 .. tostring(dq.remoteaddr) .. "|"
+                 .. tostring(dq.qname) .. "|" .. qts
+
+    write_buf[#write_buf + 1] = line
+    line_count = line_count + 1
+
+    if #write_buf >= BUF_SIZE then
+        local fd = get_fd()
+        if fd then
+            fd:write(table.concat(write_buf, "\n") .. "\n")
+            fd:flush()
+        end
+        write_buf = {}
+    end
+
+    if line_count >= MAX_LINES then
+        if log_fd then log_fd:close(); log_fd = nil end
+        os.rename("/var/log/pdns-query.log", "/var/log/pdns-query.log.1")
+        line_count = 0
+        write_buf = {}
+    end
+
     return false
 end
 ```
@@ -180,10 +234,14 @@ nginx -t && systemctl reload nginx
 ```
 ┌─────────────┐     ┌──────────────────┐     ┌─────────────────┐
 │   Clients   │────▶│  PowerDNS        │────▶│  Komdigi RPZ    │
-│             │◀────│  Recursor :53    │◀────│  (AXFR/slave)   │
+│             │◀────│  Recursor :53    │     │  (rpzFile)      │
 └─────────────┘     │                  │     └─────────────────┘
-                    │  ┌────────────┐  │
-                    │  │ query.log  │  │
+                    │  RPZ check       │
+                    │  (local, before  │     ┌─────────────────┐
+                    │   forwarding)    │────▶│  Google/CF      │
+                    │                  │◀────│  Forwarders     │
+                    │  ┌────────────┐  │     │  (fallback)     │
+                    │  │ query.log  │  │     └─────────────────┘
                     │  └─────┬──────┘  │
                     └────────┼─────────┘
                              │
