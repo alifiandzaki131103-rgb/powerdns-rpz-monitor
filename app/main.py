@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from app.query_log import read_query_log
 from app.cdn_analytics import init_cdn_db, parse_incremental, get_cdn_data
+from app.top_blocked import get_top_blocked
 import sqlite3 as _sqlite3
 from app.resources import init_resource_db, collect_and_store, get_resource_data, get_current_stats
 CDN_DB = "/opt/rpz-monitor/data/rpz-monitor.db"
@@ -677,6 +678,32 @@ async def api_cdn(request: Request, range: str = "1d"):
         return auth
     data = get_cdn_data(CDN_DB, range)
     return {**data, "range": range}
+
+
+@app.get("/top-blocked", response_class=HTMLResponse)
+async def top_blocked_page(request: Request, range: str = "1d"):
+    auth = await _require_auth(request)
+    if auth:
+        return auth
+    if range not in ("1h", "1d", "7d", "30d"):
+        range = "1d"
+    data = get_top_blocked(CDN_DB, range, limit=100)
+    return templates.TemplateResponse("top_blocked.html", {
+        "request": request,
+        "active_page": "top_blocked",
+        "data": data,
+        "range": range,
+    })
+
+
+@app.get("/api/top-blocked")
+async def api_top_blocked(request: Request, range: str = "1d", limit: int = 100):
+    auth = await _require_auth(request)
+    if auth:
+        return auth
+    if range not in ("1h", "1d", "7d", "30d"):
+        range = "1d"
+    return get_top_blocked(CDN_DB, range, limit=min(limit, 500))
 
 
 # ============================================================

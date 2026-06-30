@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+{% block title %}Top Blocked Domains - PowerDNS RPZ Monitor{% endblock %}
+{% block content %}
+<style>
+.header-row{display:flex;justify-content:space-between;align-items:center;margin-bottom:18px;gap:12px;flex-wrap:wrap}.header-row h1{font-size:28px}
+.range-buttons{display:flex;gap:8px;flex-wrap:wrap}.range-buttons a{color:var(--text-secondary);text-decoration:none;background:var(--bg-card);border:1px solid var(--border);padding:8px 12px;border-radius:var(--radius);font-size:14px}.range-buttons a.active,.range-buttons a:hover{background:var(--accent);color:white}
+.panel{background:var(--bg-card);border:1px solid var(--border);border-radius:var(--radius);padding:18px;margin-bottom:18px}.panel h2{font-size:18px;margin-bottom:14px}
+.muted{color:var(--text-muted);font-size:13px}.num{text-align:right}.domain{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono",monospace}.cache{margin-bottom:14px;color:var(--text-muted);font-size:13px}.app-dot{display:inline-block;width:10px;height:10px;border-radius:50%;margin-right:8px}.summary{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:16px;margin-bottom:18px}.summary .card{margin:0}.rank{font-weight:700;color:var(--text-secondary)}
+table{width:100%;border-collapse:collapse}th,td{padding:10px 8px;border-bottom:1px solid var(--border);text-align:left;font-size:14px}th{color:var(--text-muted);font-size:12px;text-transform:uppercase;letter-spacing:.4px}tr:hover{background:rgba(255,255,255,.03)}
+</style>
+<div class="header-row">
+  <h1>🚫 Top Blocked Domains</h1>
+  <div class="range-buttons">
+    <a href="/top-blocked?range=1h" class="{{ 'active' if range == '1h' else '' }}">1 Jam</a>
+    <a href="/top-blocked?range=1d" class="{{ 'active' if range == '1d' else '' }}">1 Hari</a>
+    <a href="/top-blocked?range=7d" class="{{ 'active' if range == '7d' else '' }}">7 Hari</a>
+    <a href="/top-blocked?range=30d" class="{{ 'active' if range == '30d' else '' }}">30 Hari</a>
+  </div>
+</div>
+
+<div class="summary">
+  <div class="card">
+    <div class="card-label">Blocked Queries</div>
+    <div class="card-value red">{{ data.total_blocked_queries }}</div>
+    <div class="card-sub">RPZ-matched query count</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Blocked Percentage</div>
+    <div class="card-value yellow">{{ data.blocked_percentage }}%</div>
+    <div class="card-sub">Of total queries in range</div>
+  </div>
+  <div class="card">
+    <div class="card-label">Total Queries</div>
+    <div class="card-value blue">{{ data.total_queries }}</div>
+    <div class="card-sub">CDN analytics database</div>
+  </div>
+</div>
+
+<div class="cache">
+  RPZ cache:
+  {% for zone, count in data.cache_info.items() %}
+    <span>{{ zone }}={{ count }}</span>{% if not loop.last %}, {% endif %}
+  {% else %}
+    empty
+  {% endfor %}
+</div>
+
+<div class="panel">
+  <h2>📋 Top Blocked Domains</h2>
+  <table>
+    <thead><tr><th>Rank</th><th>Domain</th><th class="num">Queries</th><th>App Category</th><th>QType</th><th>Last Seen</th></tr></thead>
+    <tbody>
+    {% for d in data.top_blocked %}
+      <tr>
+        <td class="rank">{{ loop.index }}</td>
+        <td class="domain">{{ d.domain }}</td>
+        <td class="num">{{ d.queries }}</td>
+        <td><span class="app-dot" data-app="{{ d.app }}"></span>{{ d.app }}</td>
+        <td>{{ d.qtype }}</td>
+        <td class="muted">{{ d.last_seen }}</td>
+      </tr>
+    {% else %}
+      <tr><td colspan="6" class="muted">No blocked query data found for selected range</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
+{% block scripts %}
+var colors = {"YouTube/Google":"#ff0000","TikTok":"#00f2ea","Facebook/Meta":"#1877f2","Netflix":"#e50914","Shopee":"#ee4d2d","Telegram":"#0088cc","Cloudflare":"#f38020","Akamai":"#0096d6","Apple":"#a2aaad","Microsoft":"#00a4ef","X/Twitter":"#1da1f2","Naver":"#03cf5d","Kwai/Kuaishou":"#ff6600","OPPO/Android":"#1a8c2f","Tokopedia":"#42b549","Grab":"#00b14f","Gojek":"#00aa13","Roblox":"#e2231a","LINE":"#00c300","Spotify":"#1db954","Video/CDN":"#9333ea","Other":"#64748b"};
+var getColor = function(name){ return colors[name] || "#64748b"; };
+document.querySelectorAll(".app-dot").forEach(function(el){ el.style.background = getColor(el.dataset.app); });
+setTimeout(function(){ window.location.reload(); }, 60000);
+{% endblock %}
