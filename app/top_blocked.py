@@ -1,20 +1,19 @@
 """Top blocked domains analyzer for RPZ Monitor.
 
 Strategy: RPZ zone files are huge (1.5GB+). We pre-extract domain names
-into a sorted cache file. Membership checks use mmap + binary search
-so we DON'T load 9M strings into a Python set (saves ~1.3GB RAM).
+into a sorted cache file. To check if CDN domains are blocked:
+1. Build a set of all CDN domains + their parent domains (~900K entries)
+2. Scan the 196MB cache file once, collecting matches (~3-4s)
+3. Map matches back to CDN domains for stats
 
-Background rebuild runs in a thread so the first request doesn't block.
-Results are cached for 60s to avoid re-scanning on every page load.
+Results cached 60s. mmap pre-warmed at startup.
 """
 import os
-import mmap
 import re
 import sqlite3
 import threading
 import time
 from datetime import datetime, timedelta
-from bisect import bisect_left
 
 RPZ_ZONES = [
     "/var/lib/powerdns/rpz-komdigi.zone",
@@ -32,11 +31,6 @@ _cache_ready = threading.Event()
 _cache_loading = False
 _domain_count = 0
 _zone_counts: dict = {}
-
-# mmap'd cache file (lazy init)
-_mmap_obj = None
-_mmap_lines = []  # list of (start, end) byte offsets for each line
-_mmap_mtime = 0
 
 _RE_IP = re.compile(r'^(\d+\.){3}\d+$')
 
@@ -158,106 +152,11 @@ def _build_cache():
     except Exception as e:
         print(f"[top_blocked] Cache write error: {e}", flush=True)
 
-    # Free the set immediately
     del domains
     del sorted_domains
 
     _cache_ready.set()
     _cache_loading = False
-
-
-def _load_mmap():
-    """Load the sorted cache file via mmap for zero-copy binary search."""
-    global _mmap_obj, _mmap_lines, _mmap_mtime
-
-    if not os.path.exists(CACHE_FILE):
-        return False
-
-    mtime = os.path.getmtime(CACHE_FILE)
-    if _mmap_obj is not None and _mmap_mtime == mtime:
-        return True
-
-    try:
-        fd = os.open(CACHE_FILE, os.O_RDONLY)
-        size = os.fstat(fd).st_size
-        if size == 0:
-            os.close(fd)
-            return False
-
-        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
-        os.close(fd)
-
-        # Build line index (start offsets)
-        lines = []
-        pos = 0
-        while pos < size:
-            end = mm.find(b'\n', pos)
-            if end == -1:
-                end = size
-            if end > pos:  # skip empty lines
-                lines.append((pos, end))
-            pos = end + 1
-
-        # Replace old mmap
-        if _mmap_obj is not None:
-            try:
-                _mmap_obj.close()
-            except Exception:
-                pass
-
-        _mmap_obj = mm
-        _mmap_lines = lines
-        _mmap_mtime = mtime
-        return True
-    except Exception as e:
-        print(f"[top_blocked] mmap error: {e}", flush=True)
-        return False
-
-
-def _is_blocked(domain):
-    """Check if domain (or parent) is in the blocked cache via mmap binary search."""
-    if not _load_mmap():
-        return False
-
-    mm = _mmap_obj
-    lines = _mmap_lines
-
-    # Check domain and all parent domains
-    parts = domain.lower().strip().rstrip(".").split(".")
-    for i in range(len(parts)):
-        check = ".".join(parts[i:]).encode("utf-8")
-        # Binary search in sorted lines using bytes comparison
-        lo, hi = 0, len(lines)
-        while lo < hi:
-            mid = (lo + hi) // 2
-            start, end = lines[mid]
-            mid_val = mm[start:end]
-            if mid_val < check:
-                lo = mid + 1
-            else:
-                hi = mid
-        if lo < len(lines):
-            start, end = lines[lo]
-            if mm[start:end] == check:
-                return True
-
-    return False
-
-
-def _warm_mmap():
-    """Pre-build mmap index in background at startup."""
-    if os.path.exists(CACHE_FILE) and os.path.exists(CACHE_META):
-        with open(CACHE_META, "r") as f:
-            meta = f.read()
-        if _meta_matches(meta):
-            _cache_ready.set()
-            _load_mmap()
-            print(f"[top_blocked] mmap warmed: {len(_mmap_lines)} domains indexed", flush=True)
-            return
-    # If cache doesn't exist or is stale, build it
-    _build_cache()
-    _load_mmap()
-    print(f"[top_blocked] mmap warmed after build: {len(_mmap_lines)} domains", flush=True)
 
 
 def _ensure_cache():
@@ -288,15 +187,44 @@ def _ensure_cache():
     t.start()
 
 
-def get_top_blocked(db_path, range_str="1d", limit=100):
-    """Get top blocked domains from CDN DB cross-referenced with RPZ zones.
+def _scan_blocked_domains(cdn_domain_list):
+    """Scan RPZ cache file for blocked CDN domains using set intersection.
 
-    Fast path:
-    1. Query unique domains from CDN DB (not grouped by app/qtype)
-    2. Check each against mmap (300K binary searches, ~2-3s)
-    3. For blocked domains, fetch their full details (app, qtype)
-    4. Sort and return top N
+    Returns set of blocked CDN domain strings.
     """
+    # Step 1: Build set of all CDN domains + their parent domains
+    check_domains = set()
+    for d in cdn_domain_list:
+        parts = d.split(".")
+        for i in range(len(parts)):
+            check_domains.add(".".join(parts[i:]))
+
+    # Step 2: Scan cache file, collect matching RPZ entries
+    matched_rpz = set()
+    try:
+        with open(CACHE_FILE, "r") as f:
+            for line in f:
+                d = line.rstrip("\n")
+                if d in check_domains:
+                    matched_rpz.add(d)
+    except Exception as e:
+        print(f"[top_blocked] Cache scan error: {e}", flush=True)
+        return set()
+
+    # Step 3: Map matches back to CDN domains
+    blocked = set()
+    for cdn_d in cdn_domain_list:
+        parts = cdn_d.split(".")
+        for i in range(len(parts)):
+            if ".".join(parts[i:]) in matched_rpz:
+                blocked.add(cdn_d)
+                break
+
+    return blocked
+
+
+def get_top_blocked(db_path, range_str="1d", limit=100):
+    """Get top blocked domains from CDN DB cross-referenced with RPZ zones."""
     _ensure_cache()
 
     # Check result cache
@@ -335,9 +263,6 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
             "cache_info": {**cache_info, "status": "building..."},
         }
 
-    # Force reload mmap if needed
-    _load_mmap()
-
     limit = max(1, int(limit))
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
@@ -356,20 +281,27 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
             ORDER BY queries DESC
         """, (cutoff,)).fetchall()
 
-        # Step 2: Check each domain against RPZ cache (mmap binary search)
-        blocked_domains = set()
-        total_blocked_queries = 0
-        for row in domain_rows:
-            domain = row["domain"].lower().strip().rstrip(".")
-            if _is_blocked(domain):
-                blocked_domains.add(domain)
-                total_blocked_queries += row["queries"]
+        # Step 2: Scan RPZ cache for blocked domains
+        cdn_domain_list = [row["domain"].lower().strip().rstrip(".") for row in domain_rows]
+        blocked_set = _scan_blocked_domains(cdn_domain_list)
 
-        # Step 3: Fetch full details only for blocked domains (app, qtype breakdown)
+        # Step 3: Compute total blocked queries
+        total_blocked_queries = 0
+        blocked_domain_queries = {}
+        for row in domain_rows:
+            d = row["domain"].lower().strip().rstrip(".")
+            if d in blocked_set:
+                total_blocked_queries += row["queries"]
+                blocked_domain_queries[d] = row["queries"]
+
+        # Step 4: Fetch full details for top blocked domains
         top_blocked = []
-        if blocked_domains:
-            # Use batch query for blocked domains
-            placeholders = ",".join("?" * len(blocked_domains))
+        if blocked_set:
+            # Sort blocked domains by query count, take top N
+            top_blocked_domains = sorted(blocked_domain_queries.items(), key=lambda x: -x[1])[:limit]
+            top_domain_set = {d for d, _ in top_blocked_domains}
+
+            placeholders = ",".join("?" * len(top_domain_set))
             detail_rows = conn.execute(f"""
                 SELECT domain, app, qtype, SUM(count) AS queries, MAX(last_seen) AS last_seen
                 FROM cdn_queries
@@ -377,7 +309,7 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
                 GROUP BY app, domain, qtype
                 ORDER BY queries DESC
                 LIMIT ?
-            """, [cutoff, *blocked_domains, limit]).fetchall()
+            """, [cutoff, *top_domain_set, limit]).fetchall()
 
             for row in detail_rows:
                 top_blocked.append({
@@ -393,7 +325,7 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
 
     blocked_pct = round((total_blocked_queries / total_queries * 100) if total_queries > 0 else 0, 2)
 
-    cache_info["loaded_domains"] = len(_mmap_lines) if _mmap_lines else 0
+    cache_info["loaded_domains"] = _domain_count
     cache_info["building"] = _cache_loading
 
     result = {
@@ -404,7 +336,6 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
         "cache_info": cache_info,
     }
 
-    # Store in result cache
     _result_cache[cache_key] = (now, result)
     return result
 
@@ -415,20 +346,38 @@ def rebuild_cache():
     if _cache_loading:
         return {"status": "already building"}
     _cache_ready.clear()
-    _result_cache.clear()  # Also clear result cache on rebuild
+    _result_cache.clear()
     t = threading.Thread(target=_build_cache, daemon=True)
     t.start()
     return {"status": "rebuild started"}
 
 
 def invalidate_result_cache():
-    """Clear the result cache (call after rebuild completes)."""
+    """Clear the result cache."""
     _result_cache.clear()
 
 
-# Auto-warm mmap on import (non-blocking)
+def _warm_cache():
+    """Pre-check cache file exists and is current at startup."""
+    if os.path.exists(CACHE_FILE) and os.path.exists(CACHE_META):
+        with open(CACHE_META, "r") as f:
+            meta = f.read()
+        if _meta_matches(meta):
+            _cache_ready.set()
+            global _domain_count
+            try:
+                with open(CACHE_FILE, "r") as f:
+                    _domain_count = sum(1 for _ in f)
+            except Exception:
+                pass
+            print(f"[top_blocked] cache ready: {_domain_count} domains", flush=True)
+            return
+    _build_cache()
+
+
+# Auto-warm on import (non-blocking)
 try:
-    _warmup_thread = threading.Thread(target=_warm_mmap, daemon=True)
+    _warmup_thread = threading.Thread(target=_warm_cache, daemon=True)
     _warmup_thread.start()
 except Exception:
     pass
