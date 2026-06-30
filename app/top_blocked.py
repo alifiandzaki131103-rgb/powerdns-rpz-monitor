@@ -289,7 +289,14 @@ def _ensure_cache():
 
 
 def get_top_blocked(db_path, range_str="1d", limit=100):
-    """Get top blocked domains from CDN DB cross-referenced with RPZ zones."""
+    """Get top blocked domains from CDN DB cross-referenced with RPZ zones.
+
+    Fast path:
+    1. Query unique domains from CDN DB (not grouped by app/qtype)
+    2. Check each against mmap (300K binary searches, ~2-3s)
+    3. For blocked domains, fetch their full details (app, qtype)
+    4. Sort and return top N
+    """
     _ensure_cache()
 
     # Check result cache
@@ -340,27 +347,39 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
             (cutoff,),
         ).fetchone()[0]
 
-        # Only fetch top N*5 rows to avoid scanning entire DB
-        # Some won't be blocked, so fetch extra buffer
-        fetch_limit = min(limit * 5, 5000)
-        rows = conn.execute("""
-            SELECT domain, app, qtype, SUM(count) AS queries, MAX(last_seen) AS last_seen
+        # Step 1: Get all unique domains with total query count
+        domain_rows = conn.execute("""
+            SELECT domain, SUM(count) AS queries
             FROM cdn_queries
             WHERE bucket >= ?
-            GROUP BY app, domain, qtype
+            GROUP BY domain
             ORDER BY queries DESC
-            LIMIT ?
-        """, (cutoff, fetch_limit)).fetchall()
-    finally:
-        conn.close()
+        """, (cutoff,)).fetchall()
 
-    top_blocked = []
-    total_blocked_queries = 0
-    for row in rows:
-        domain = row["domain"].lower().strip().rstrip(".")
-        if _is_blocked(domain):
-            total_blocked_queries += row["queries"]
-            if len(top_blocked) < limit:
+        # Step 2: Check each domain against RPZ cache (mmap binary search)
+        blocked_domains = set()
+        total_blocked_queries = 0
+        for row in domain_rows:
+            domain = row["domain"].lower().strip().rstrip(".")
+            if _is_blocked(domain):
+                blocked_domains.add(domain)
+                total_blocked_queries += row["queries"]
+
+        # Step 3: Fetch full details only for blocked domains (app, qtype breakdown)
+        top_blocked = []
+        if blocked_domains:
+            # Use batch query for blocked domains
+            placeholders = ",".join("?" * len(blocked_domains))
+            detail_rows = conn.execute(f"""
+                SELECT domain, app, qtype, SUM(count) AS queries, MAX(last_seen) AS last_seen
+                FROM cdn_queries
+                WHERE bucket >= ? AND domain IN ({placeholders})
+                GROUP BY app, domain, qtype
+                ORDER BY queries DESC
+                LIMIT ?
+            """, [cutoff, *blocked_domains, limit]).fetchall()
+
+            for row in detail_rows:
                 top_blocked.append({
                     "domain": row["domain"],
                     "queries": row["queries"],
@@ -368,6 +387,9 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
                     "qtype": row["qtype"],
                     "last_seen": row["last_seen"],
                 })
+
+    finally:
+        conn.close()
 
     blocked_pct = round((total_blocked_queries / total_queries * 100) if total_queries > 0 else 0, 2)
 
