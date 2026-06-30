@@ -1,37 +1,41 @@
 """Top blocked domains analyzer for RPZ Monitor.
 
 Strategy: RPZ zone files are huge (1.5GB+). We pre-extract domain names
-into a compact cache file (~one domain per line). The cache is rebuilt
-only when the zone file mtime changes. The cache file is loaded once
-into a set and held in memory.
+into a sorted cache file. Membership checks use mmap + binary search
+so we DON'T load 9M strings into a Python set (saves ~1.3GB RAM).
 
 Background rebuild runs in a thread so the first request doesn't block.
 """
 import os
+import mmap
 import re
 import sqlite3
 import threading
 from datetime import datetime, timedelta
+from bisect import bisect_left
 
 RPZ_ZONES = [
     "/var/lib/powerdns/rpz-komdigi.zone",
     "/var/lib/powerdns/rpz-local.zone",
 ]
 
-# Zone origins to strip from domain names
 RPZ_ORIGINS = [".trustpositifkominfo", ".rpz.local", ".rpz-local"]
 
 CACHE_DIR = "/opt/rpz-monitor/data"
 CACHE_FILE = os.path.join(CACHE_DIR, "rpz-domains-cache.txt")
 CACHE_META = os.path.join(CACHE_DIR, "rpz-domains-cache.meta")
 
-# In-memory set of blocked domains (loaded from cache file)
-_blocked_set: set = set()
-_blocked_set_ready = threading.Event()
-_blocked_set_loading = False
-_domain_counts: dict = {}  # {zone_path: count}
+# State
+_cache_ready = threading.Event()
+_cache_loading = False
+_domain_count = 0
+_zone_counts: dict = {}
 
-# Regex to detect IP-like RPZ entries (reversed IPs)
+# mmap'd cache file (lazy init)
+_mmap_obj = None
+_mmap_lines = []  # list of (start, end) byte offsets for each line
+_mmap_mtime = 0
+
 _RE_IP = re.compile(r'^(\d+\.){3}\d+$')
 
 
@@ -60,35 +64,26 @@ def _meta_matches(meta_str):
 
 
 def _clean_domain(raw, origin_suffixes):
-    """Strip RPZ origin suffix, wildcard prefix, trailing dot.
-    Returns clean domain string or None if should skip."""
+    """Strip RPZ origin suffix, wildcard prefix, trailing dot."""
     d = raw.lower().rstrip(".")
-
-    # Strip wildcard prefix
     if d.startswith("*."):
         d = d[2:]
-
-    # Strip RPZ origin suffix (e.g. .trustpositifkominfo)
     for suffix in origin_suffixes:
         if d.endswith(suffix):
             d = d[:-len(suffix)]
             break
-
     d = d.rstrip(".")
     if not d or d == "@" or d.isdigit():
         return None
-
-    # Skip reversed-IP entries (RPZ sometimes blocks by IP)
     if _RE_IP.match(d):
         return None
-
     return d
 
 
 def _build_cache():
-    """Stream-parse RPZ zone files, extract domain names, write to cache file."""
-    global _blocked_set_loading
-    _blocked_set_loading = True
+    """Stream-parse RPZ zone files, extract domain names, write sorted cache."""
+    global _cache_loading, _domain_count, _zone_counts
+    _cache_loading = True
     os.makedirs(CACHE_DIR, exist_ok=True)
 
     record_types = {
@@ -109,20 +104,15 @@ def _build_cache():
         if not os.path.exists(zone_path):
             counts[zone_path] = 0
             continue
-
         try:
             with open(zone_path, "r", errors="replace") as f:
                 for raw_line in f:
-                    # Strip inline comments
                     line = raw_line.split(";")[0].strip()
                     if not line or line.startswith("$"):
                         continue
-
                     parts = line.split()
                     if len(parts) < 2:
                         continue
-
-                    # Find record type
                     rr_type = None
                     for p in parts[1:5]:
                         up = p.upper()
@@ -131,28 +121,24 @@ def _build_cache():
                         if up in record_types:
                             rr_type = up
                             break
-
                     if rr_type in (None, *skip_types):
                         continue
-
-                    # Clean domain: strip origin suffix, wildcard, trailing dot
                     domain = _clean_domain(parts[0], RPZ_ORIGINS)
                     if domain is None:
                         continue
-
                     domains.add(domain)
                     count += 1
         except Exception as e:
             print(f"[top_blocked] Error parsing {zone_path}: {e}", flush=True)
-
         counts[zone_path] = count
-        print(f"[top_blocked] Parsed {zone_path}: {count} records -> {len(domains)} unique clean domains", flush=True)
+        print(f"[top_blocked] Parsed {zone_path}: {count} records -> {len(domains)} unique", flush=True)
 
-    # Write cache file
+    # Write sorted cache file
     try:
         tmp = CACHE_FILE + ".tmp"
+        sorted_domains = sorted(domains)
         with open(tmp, "w") as f:
-            for d in sorted(domains):
+            for d in sorted_domains:
                 f.write(d + "\n")
         os.replace(tmp, CACHE_FILE)
 
@@ -160,71 +146,130 @@ def _build_cache():
         with open(CACHE_META, "w") as f:
             f.write("\n".join(meta_lines) + "\n")
 
-        print(f"[top_blocked] Cache built: {len(domains)} unique domains -> {CACHE_FILE}", flush=True)
+        _domain_count = len(sorted_domains)
+        _zone_counts = counts
+        print(f"[top_blocked] Cache built: {_domain_count} domains -> {CACHE_FILE}", flush=True)
     except Exception as e:
         print(f"[top_blocked] Cache write error: {e}", flush=True)
 
-    global _blocked_set, _domain_counts
-    _blocked_set = domains
-    _domain_counts = counts
-    _blocked_set_ready.set()
-    _blocked_set_loading = False
+    # Free the set immediately
+    del domains
+    del sorted_domains
+
+    _cache_ready.set()
+    _cache_loading = False
 
 
-def _ensure_loaded():
-    """Ensure the blocked domain set is loaded."""
-    global _blocked_set_loading
+def _load_mmap():
+    """Load the sorted cache file via mmap for zero-copy binary search."""
+    global _mmap_obj, _mmap_lines, _mmap_mtime
 
-    if _blocked_set_ready.is_set():
+    if not os.path.exists(CACHE_FILE):
+        return False
+
+    mtime = os.path.getmtime(CACHE_FILE)
+    if _mmap_obj is not None and _mmap_mtime == mtime:
+        return True
+
+    try:
+        fd = os.open(CACHE_FILE, os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        if size == 0:
+            os.close(fd)
+            return False
+
+        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+        os.close(fd)
+
+        # Build line index (start offsets)
+        lines = []
+        pos = 0
+        while pos < size:
+            end = mm.find(b'\n', pos)
+            if end == -1:
+                end = size
+            if end > pos:  # skip empty lines
+                lines.append((pos, end))
+            pos = end + 1
+
+        # Replace old mmap
+        if _mmap_obj is not None:
+            try:
+                _mmap_obj.close()
+            except Exception:
+                pass
+
+        _mmap_obj = mm
+        _mmap_lines = lines
+        _mmap_mtime = mtime
+        return True
+    except Exception as e:
+        print(f"[top_blocked] mmap error: {e}", flush=True)
+        return False
+
+
+def _is_blocked(domain):
+    """Check if domain (or parent) is in the blocked cache via mmap binary search."""
+    if not _load_mmap():
+        return False
+
+    mm = _mmap_obj
+    lines = _mmap_lines
+
+    # Check domain and all parent domains
+    parts = domain.lower().strip().rstrip(".").split(".")
+    for i in range(len(parts)):
+        check = ".".join(parts[i:])
+        # Binary search in sorted lines
+        lo, hi = 0, len(lines)
+        while lo < hi:
+            mid = (lo + hi) // 2
+            start, end = lines[mid]
+            mid_val = mm[start:end].decode("utf-8", errors="replace")
+            if mid_val < check:
+                lo = mid + 1
+            else:
+                hi = mid
+        if lo < len(lines):
+            start, end = lines[lo]
+            if mm[start:end].decode("utf-8", errors="replace") == check:
+                return True
+
+    return False
+
+
+def _ensure_cache():
+    """Ensure cache file exists and is current."""
+    global _cache_loading
+
+    if _cache_ready.is_set():
         if os.path.exists(CACHE_META):
             with open(CACHE_META, "r") as f:
                 meta = f.read()
             if _meta_matches(meta):
                 return
-            _blocked_set_ready.clear()
+            _cache_ready.clear()
         else:
-            _blocked_set_ready.clear()
+            _cache_ready.clear()
 
-    if _blocked_set_loading:
+    if _cache_loading:
         return
 
-    # Try loading from cache file if meta matches
     if os.path.exists(CACHE_FILE) and os.path.exists(CACHE_META):
         with open(CACHE_META, "r") as f:
             meta = f.read()
         if _meta_matches(meta):
-            try:
-                with open(CACHE_FILE, "r") as f:
-                    _blocked_set.clear()
-                    for line in f:
-                        d = line.strip()
-                        if d:
-                            _blocked_set.add(d)
-                _domain_counts = {}
-                for p in RPZ_ZONES:
-                    _domain_counts[p] = len(_blocked_set)
-                _blocked_set_ready.set()
-                print(f"[top_blocked] Loaded {len(_blocked_set)} domains from cache file", flush=True)
-                return
-            except Exception:
-                pass
+            _cache_ready.set()
+            return
 
-    # Full rebuild in background thread
     t = threading.Thread(target=_build_cache, daemon=True)
     t.start()
 
 
-def get_all_blocked_domains():
-    """Get combined set of all blocked domains from cache."""
-    _ensure_loaded()
-    if _blocked_set_ready.is_set():
-        return _blocked_set
-    _blocked_set_ready.wait(timeout=300)
-    return _blocked_set
-
-
 def get_top_blocked(db_path, range_str="1d", limit=100):
     """Get top blocked domains from CDN DB cross-referenced with RPZ zones."""
+    _ensure_cache()
+
     range_deltas = {
         "1h": timedelta(hours=1),
         "1d": timedelta(days=1),
@@ -234,26 +279,27 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
     delta = range_deltas.get(range_str, timedelta(days=1))
     cutoff = (datetime.now() - delta).strftime("%Y-%m-%d %H:%M:%S")
 
-    blocked = get_all_blocked_domains()
-
     cache_info = {}
     for zone_path in RPZ_ZONES:
         name = os.path.basename(zone_path)
-        if zone_path in _domain_counts:
-            cache_info[name] = _domain_counts[zone_path]
+        if zone_path in _zone_counts:
+            cache_info[name] = _zone_counts[zone_path]
         elif os.path.exists(zone_path):
             cache_info[name] = "loading..."
         else:
             cache_info[name] = "not found"
 
-    if not blocked:
+    if not _cache_ready.is_set():
         return {
             "top_blocked": [],
             "total_blocked_queries": 0,
             "total_queries": 0,
             "blocked_percentage": 0,
-            "cache_info": {**cache_info, "error": "No RPZ domains loaded"},
+            "cache_info": {**cache_info, "status": "building..."},
         }
+
+    # Force reload mmap if needed
+    _load_mmap()
 
     limit = max(1, int(limit))
     conn = sqlite3.connect(db_path)
@@ -278,18 +324,7 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
     total_blocked_queries = 0
     for row in rows:
         domain = row["domain"].lower().strip().rstrip(".")
-        is_blocked = False
-        if domain in blocked:
-            is_blocked = True
-        else:
-            # Check parent domains
-            parts = domain.split(".")
-            for i in range(1, len(parts)):
-                if ".".join(parts[i:]) in blocked:
-                    is_blocked = True
-                    break
-
-        if is_blocked:
+        if _is_blocked(domain):
             total_blocked_queries += row["queries"]
             if len(top_blocked) < limit:
                 top_blocked.append({
@@ -302,8 +337,8 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
 
     blocked_pct = round((total_blocked_queries / total_queries * 100) if total_queries > 0 else 0, 2)
 
-    cache_info["loaded_domains"] = len(blocked)
-    cache_info["building"] = _blocked_set_loading
+    cache_info["loaded_domains"] = len(_mmap_lines) if _mmap_lines else 0
+    cache_info["building"] = _cache_loading
 
     return {
         "top_blocked": top_blocked,
@@ -316,10 +351,10 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
 
 def rebuild_cache():
     """Force rebuild the cache."""
-    global _blocked_set_loading
-    if _blocked_set_loading:
+    global _cache_loading
+    if _cache_loading:
         return {"status": "already building"}
-    _blocked_set_ready.clear()
+    _cache_ready.clear()
     t = threading.Thread(target=_build_cache, daemon=True)
     t.start()
     return {"status": "rebuild started"}
