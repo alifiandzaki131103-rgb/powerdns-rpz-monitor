@@ -1,12 +1,17 @@
 """CDN analytics for RPZ Monitor."""
 import os
 import sqlite3
+import time
 from datetime import datetime, timedelta
 
 DB_PATH = "/opt/rpz-monitor/data/rpz-monitor.db"
 LOG_PATH = "/var/log/pdns-query.log"
 MAX_BYTES = 20 * 1024 * 1024
 RETENTION_DAYS = 30
+
+# Result cache: {range_str: (timestamp, result_dict)}
+_cdn_result_cache = {}
+_CDN_RESULT_TTL = 60  # seconds
 
 CDN_PATTERNS = {
     "YouTube/Google": ["youtube.com", "googlevideo.com", "ytimg.com", "ggpht.com", "googleapis.com", "gvt1.com", "google.com", "google.co.id", "googleusercontent.com", "gstatic.com", "gstatic.cn", "googleadservices.com", "googlesyndication.com", "google-analytics.com", "googletagmanager.com", "doubleclick.net", "gvt2.com"],
@@ -150,6 +155,13 @@ def _range_delta(range_str):
 
 
 def get_cdn_data(db_path=DB_PATH, range_str="1d"):
+    # Check result cache
+    now = time.time()
+    if range_str in _cdn_result_cache:
+        ts, result = _cdn_result_cache[range_str]
+        if now - ts < _CDN_RESULT_TTL:
+            return result
+
     init_cdn_db(db_path)
     cutoff = (datetime.now() - _range_delta(range_str)).strftime("%Y-%m-%d %H:%M:%S")
     with sqlite3.connect(db_path) as conn:
@@ -169,4 +181,6 @@ def get_cdn_data(db_path=DB_PATH, range_str="1d"):
         """, (cutoff,))]
         offset = conn.execute("SELECT inode, offset, updated_at FROM cdn_offsets WHERE log_path=?", (LOG_PATH,)).fetchone()
         stats = {"total_queries": total, "range": range_str, "cutoff": cutoff, "offset": dict(offset) if offset else None}
-    return {"apps": apps, "domains": domains, "stats": stats}
+    result = {"apps": apps, "domains": domains, "stats": stats}
+    _cdn_result_cache[range_str] = (now, result)
+    return result
