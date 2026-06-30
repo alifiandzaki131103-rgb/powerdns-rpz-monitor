@@ -359,17 +359,23 @@ def invalidate_result_cache():
 
 def _warm_cache():
     """Pre-check cache file exists and is current at startup."""
+    global _domain_count, _zone_counts
     if os.path.exists(CACHE_FILE) and os.path.exists(CACHE_META):
         with open(CACHE_META, "r") as f:
             meta = f.read()
         if _meta_matches(meta):
             _cache_ready.set()
-            global _domain_count
             try:
                 with open(CACHE_FILE, "r") as f:
                     _domain_count = sum(1 for _ in f)
             except Exception:
                 pass
+            # Populate zone counts from zone files
+            for zone_path in RPZ_ZONES:
+                if os.path.exists(zone_path):
+                    _zone_counts[zone_path] = "cached"
+                else:
+                    _zone_counts[zone_path] = 0
             print(f"[top_blocked] cache ready: {_domain_count} domains", flush=True)
             return
     _build_cache()
