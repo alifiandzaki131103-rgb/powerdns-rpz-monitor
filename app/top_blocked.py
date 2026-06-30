@@ -5,12 +5,14 @@ into a sorted cache file. Membership checks use mmap + binary search
 so we DON'T load 9M strings into a Python set (saves ~1.3GB RAM).
 
 Background rebuild runs in a thread so the first request doesn't block.
+Results are cached for 60s to avoid re-scanning on every page load.
 """
 import os
 import mmap
 import re
 import sqlite3
 import threading
+import time
 from datetime import datetime, timedelta
 from bisect import bisect_left
 
@@ -37,6 +39,10 @@ _mmap_lines = []  # list of (start, end) byte offsets for each line
 _mmap_mtime = 0
 
 _RE_IP = re.compile(r'^(\d+\.){3}\d+$')
+
+# Result cache: {(range_str, limit): (timestamp, result_dict)}
+_result_cache = {}
+_RESULT_TTL = 60  # seconds
 
 
 def _zone_mtime(path):
@@ -219,23 +225,39 @@ def _is_blocked(domain):
     # Check domain and all parent domains
     parts = domain.lower().strip().rstrip(".").split(".")
     for i in range(len(parts)):
-        check = ".".join(parts[i:])
-        # Binary search in sorted lines
+        check = ".".join(parts[i:]).encode("utf-8")
+        # Binary search in sorted lines using bytes comparison
         lo, hi = 0, len(lines)
         while lo < hi:
             mid = (lo + hi) // 2
             start, end = lines[mid]
-            mid_val = mm[start:end].decode("utf-8", errors="replace")
+            mid_val = mm[start:end]
             if mid_val < check:
                 lo = mid + 1
             else:
                 hi = mid
         if lo < len(lines):
             start, end = lines[lo]
-            if mm[start:end].decode("utf-8", errors="replace") == check:
+            if mm[start:end] == check:
                 return True
 
     return False
+
+
+def _warm_mmap():
+    """Pre-build mmap index in background at startup."""
+    if os.path.exists(CACHE_FILE) and os.path.exists(CACHE_META):
+        with open(CACHE_META, "r") as f:
+            meta = f.read()
+        if _meta_matches(meta):
+            _cache_ready.set()
+            _load_mmap()
+            print(f"[top_blocked] mmap warmed: {len(_mmap_lines)} domains indexed", flush=True)
+            return
+    # If cache doesn't exist or is stale, build it
+    _build_cache()
+    _load_mmap()
+    print(f"[top_blocked] mmap warmed after build: {len(_mmap_lines)} domains", flush=True)
 
 
 def _ensure_cache():
@@ -269,6 +291,14 @@ def _ensure_cache():
 def get_top_blocked(db_path, range_str="1d", limit=100):
     """Get top blocked domains from CDN DB cross-referenced with RPZ zones."""
     _ensure_cache()
+
+    # Check result cache
+    cache_key = (range_str, int(limit))
+    now = time.time()
+    if cache_key in _result_cache:
+        ts, result = _result_cache[cache_key]
+        if now - ts < _RESULT_TTL:
+            return result
 
     range_deltas = {
         "1h": timedelta(hours=1),
@@ -310,13 +340,17 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
             (cutoff,),
         ).fetchone()[0]
 
+        # Only fetch top N*5 rows to avoid scanning entire DB
+        # Some won't be blocked, so fetch extra buffer
+        fetch_limit = min(limit * 5, 5000)
         rows = conn.execute("""
             SELECT domain, app, qtype, SUM(count) AS queries, MAX(last_seen) AS last_seen
             FROM cdn_queries
             WHERE bucket >= ?
             GROUP BY app, domain, qtype
             ORDER BY queries DESC
-        """, (cutoff,)).fetchall()
+            LIMIT ?
+        """, (cutoff, fetch_limit)).fetchall()
     finally:
         conn.close()
 
@@ -340,13 +374,17 @@ def get_top_blocked(db_path, range_str="1d", limit=100):
     cache_info["loaded_domains"] = len(_mmap_lines) if _mmap_lines else 0
     cache_info["building"] = _cache_loading
 
-    return {
+    result = {
         "top_blocked": top_blocked,
         "total_blocked_queries": total_blocked_queries,
         "total_queries": total_queries,
         "blocked_percentage": blocked_pct,
         "cache_info": cache_info,
     }
+
+    # Store in result cache
+    _result_cache[cache_key] = (now, result)
+    return result
 
 
 def rebuild_cache():
@@ -355,6 +393,20 @@ def rebuild_cache():
     if _cache_loading:
         return {"status": "already building"}
     _cache_ready.clear()
+    _result_cache.clear()  # Also clear result cache on rebuild
     t = threading.Thread(target=_build_cache, daemon=True)
     t.start()
     return {"status": "rebuild started"}
+
+
+def invalidate_result_cache():
+    """Clear the result cache (call after rebuild completes)."""
+    _result_cache.clear()
+
+
+# Auto-warm mmap on import (non-blocking)
+try:
+    _warmup_thread = threading.Thread(target=_warm_mmap, daemon=True)
+    _warmup_thread.start()
+except Exception:
+    pass
