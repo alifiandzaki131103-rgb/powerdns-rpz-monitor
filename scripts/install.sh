@@ -5,6 +5,11 @@
 # ============================================================
 set -euo pipefail
 
+# Fix stdin when running via: curl ... | bash
+if [[ ! -t 0 ]]; then
+    exec < /dev/tty
+fi
+
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
