@@ -40,16 +40,20 @@ Web GUI monitoring untuk PowerDNS Recursor dengan RPZ (Response Policy Zone) Kom
 Interactive installer — bisa full install atau step-by-step:
 
 ```bash
-curl -sL https://raw.githubusercontent.com/alifiandzaki131103-rgb/powerdns-rpz-monitor/main/scripts/install.sh | bash
-```
+# Option 1: process substitution (stdin tetap terminal, interactive works)
+bash <(curl -sL https://raw.githubusercontent.com/alifiandzaki131103-rgb/powerdns-rpz-monitor/main/scripts/install.sh)
 
-Atau clone dulu:
+# Option 2: download dulu, baru jalankan
+curl -sL https://raw.githubusercontent.com/alifiandzaki131103-rgb/powerdns-rpz-monitor/main/scripts/install.sh -o install.sh
+bash install.sh
 
-```bash
+# Option 3: clone repo
 git clone https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor.git
 cd powerdns-rpz-monitor
 bash scripts/install.sh
 ```
+
+> ⚠️ **Jangan pakai `curl ... | bash`** — pipe mengambil stdin, `read` di script tidak bisa menerima input. Pakai salah satu opsi di atas.
 
 Menu installer:
 
