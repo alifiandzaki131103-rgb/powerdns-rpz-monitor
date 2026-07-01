@@ -1,0 +1,819 @@
+#!/bin/bash
+# ============================================================
+#  PowerDNS RPZ Monitor — Interactive Installer
+#  Repo: https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor
+# ============================================================
+set -euo pipefail
+
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+CYAN='\033[0;36m'
+BOLD='\033[1m'
+NC='\033[0m'
+
+APP_DIR="/opt/rpz-monitor"
+PDNS_CONF="/etc/powerdns/recursor.conf"
+PDNS_LUA="/etc/powerdns/recursor.lua"
+QUERY_LUA="/etc/powerdns/query-log.lua"
+SERVICE_FILE="/etc/systemd/system/rpz-monitor.service"
+NGINX_CONF="/etc/nginx/sites-available/rpz-monitor"
+NGINX_LINK="/etc/nginx/sites-enabled/rpz-monitor"
+RPZ_LOCAL="/var/lib/powerdns/rpz-local.zone"
+QUERY_LOG="/var/log/pdns-query.log"
+
+GITHUB_REPO="https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor.git"
+
+# ── Helpers ──────────────────────────────────────────────────
+
+info()  { echo -e "${CYAN}[INFO]${NC} $*"; }
+ok()    { echo -e "${GREEN}[OK]${NC} $*"; }
+warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
+err()   { echo -e "${RED}[ERR]${NC} $*"; }
+hr()    { echo -e "${CYAN}────────────────────────────────────────────${NC}"; }
+
+confirm() {
+    local msg="$1"
+    local default="${2:-y}"
+    if [[ "$default" == "y" ]]; then
+        read -rp "$(echo -e "${YELLOW}$msg [Y/n]:${NC} ")" ans
+        ans="${ans:-y}"
+    else
+        read -rp "$(echo -e "${YELLOW}$msg [y/N]:${NC} ")" ans
+        ans="${ans:-n}"
+    fi
+    [[ "$ans" =~ ^[yY] ]]
+}
+
+require_root() {
+    if [[ $EUID -ne 0 ]]; then
+        err "Harus dijalankan sebagai root"
+        exit 1
+    fi
+}
+
+check_os() {
+    if [[ -f /etc/os-release ]]; then
+        . /etc/os-release
+        OS_ID="$ID"
+        OS_VER="$VERSION_ID"
+    else
+        err "Tidak bisa deteksi OS"
+        exit 1
+    fi
+}
+
+pause() {
+    echo ""
+    read -rp "Tekan Enter untuk lanjut..."
+}
+
+# ── Step 1: System Preparation ──────────────────────────────
+
+step_system_prep() {
+    hr
+    info "STEP 1: System Preparation"
+    hr
+
+    # Disable systemd-resolved (port 53 conflict)
+    if systemctl is-active --quiet systemd-resolved 2>/dev/null; then
+        info "Stopping systemd-resolved (port 53 conflict)..."
+        systemctl stop systemd-resolved
+        systemctl disable systemd-resolved
+        ok "systemd-resolved disabled"
+    else
+        info "systemd-resolved sudah tidak aktif, skip"
+    fi
+
+    # Fix resolv.conf
+    if [[ -L /etc/resolv.conf ]] || ! grep -q "8.8.8.8" /etc/resolv.conf 2>/dev/null; then
+        info "Setting resolv.conf..."
+        echo "nameserver 127.0.0.1" > /etc/resolv.conf
+        echo "nameserver 8.8.8.8" >> /etc/resolv.conf
+        ok "resolv.conf updated"
+    fi
+
+    # Update & install packages
+    info "Updating package list..."
+    apt update -qq
+
+    info "Installing PowerDNS Recursor + tools..."
+    apt install -y pdns-recursor pdns-tools dnsutils curl nginx python3 python3-venv python3-pip git
+
+    systemctl enable pdns-recursor
+    ok "Packages installed"
+
+    # Create rpzmon user
+    if ! id rpzmon &>/dev/null; then
+        useradd --system --home "$APP_DIR" --shell /usr/sbin/nologin rpzmon
+        usermod -aG pdns rpzmon
+        ok "User rpzmon created"
+    else
+        info "User rpzmon sudah ada, skip"
+    fi
+
+    # Create directories
+    mkdir -p "$APP_DIR" /var/lib/powerdns
+    ok "System preparation selesai"
+}
+
+# ── Step 2: PowerDNS Recursor Config ────────────────────────
+
+step_pdns_config() {
+    hr
+    info "STEP 2: PowerDNS Recursor Configuration"
+    hr
+
+    # Gather allow-from subnets
+    local default_allow="127.0.0.0/8, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10"
+    echo ""
+    info "Konfigurasi allow-from (subnet yang boleh query DNS)"
+    info "Default: $default_allow"
+    read -rp "$(echo -e "${YELLOW}Tambah subnet publik? (contoh: 103.55.252.0/23) [kosongkan jika tidak]:${NC} ")" extra_subnets
+    if [[ -n "$extra_subnets" ]]; then
+        default_allow="$default_allow, $extra_subnets"
+    fi
+
+    # API key
+    local api_key="rpzmonitor2026"
+    read -rp "$(echo -e "${YELLOW}PowerDNS API Key [$api_key]:${NC} ")" input_key
+    api_key="${input_key:-$api_key}"
+
+    # Webserver password
+    local web_pass="admin123"
+    read -rp "$(echo -e "${YELLOW}PowerDNS Webserver Password [$web_pass]:${NC} ")" input_pass
+    web_pass="${input_pass:-$web_pass}"
+
+    # Threads
+    local threads
+    threads=$(nproc 2>/dev/null || echo 4)
+    read -rp "$(echo -e "${YELLOW}Threads [$threads]:${NC} ")" input_threads
+    threads="${input_threads:-$threads}"
+
+    # Backup existing config
+    [[ -f "$PDNS_CONF" ]] && cp "$PDNS_CONF" "${PDNS_CONF}.bak.$(date +%s)"
+
+    cat > "$PDNS_CONF" <<EOF
+# PowerDNS Recursor - RPZ Monitor
+# Generated by install.sh on $(date)
+
+local-address=0.0.0.0
+local-port=53
+allow-from=$default_allow
+
+# Web API
+webserver=yes
+webserver-address=0.0.0.0
+webserver-port=8082
+webserver-allow-from=0.0.0.0/0
+webserver-password=$web_pass
+api-key=$api_key
+
+# Lua config for RPZ
+lua-config-file=/etc/powerdns/recursor.lua
+
+# Performance
+threads=$threads
+max-cache-entries=1000000
+max-negative-ttl=3600
+max-cache-ttl=86400
+
+# Logging
+loglevel=4
+log-common-errors=yes
+log-rpz-changes=yes
+
+# Stats
+stats-ringbuffer-entries=50000
+lua-dns-script=/etc/powerdns/query-log.lua
+
+# Network tuning
+network-timeout=3000
+
+# Fallback forwarders (RPZ checked locally first)
+forward-zones-recurse=.=8.8.8.8;1.1.1.1;8.8.4.4;1.0.0.1
+EOF
+
+    ok "recursor.conf ditulis"
+
+    # Validate
+    if pdns_recursor --check-config 2>/dev/null; then
+        ok "Config validasi pass"
+    else
+        warn "Config validasi gagal — cek $PDNS_CONF"
+    fi
+}
+
+# ── Step 3: Lua RPZ Config ──────────────────────────────────
+
+step_lua_config() {
+    hr
+    info "STEP 3: Lua RPZ Configuration"
+    hr
+
+    echo ""
+    info "Pilih mode sync Komdigi RPZ:"
+    echo "  1) rpzFile   — load dari file lokal (stabil, perlu fetch manual/periodic)"
+    echo "  2) rpzPrimary — AXFR langsung dari master Komdigi (butuh approval IP)"
+    read -rp "$(echo -e "${YELLOW}Pilih [1]:${NC} ")" rpz_mode
+    rpz_mode="${rpz_mode:-1}"
+
+    # Local RPZ zone
+    if [[ ! -f "$RPZ_LOCAL" ]]; then
+        info "Membuat rpz-local.zone kosong..."
+        cat > "$RPZ_LOCAL" <<'EOF'
+$ORIGIN rpz.local.
+$TTL 3600
+@       IN      SOA     ns.rpz.local. admin.rpz.local. (
+                        $(date +%Y%m%d%H)  ; serial
+                        3600    ; refresh
+                        900     ; retry
+                        604800  ; expire
+                        3600 )  ; minimum
+@       IN      NS      localhost.
+EOF
+        ok "rpz-local.zone created"
+    else
+        info "rpz-local.zone sudah ada, skip"
+    fi
+
+    # Komdigi zone file (if rpzFile mode)
+    if [[ "$rpz_mode" == "1" ]]; then
+        local rpz_komdigi="/var/lib/powerdns/rpz-komdigi.zone"
+        if [[ ! -f "$rpz_komdigi" ]]; then
+            warn "rpz-komdigi.zone belum ada di $rpz_komdigi"
+            info "Jalankan fetch-rpz-zone.sh setelah install untuk download zone dari master Komdigi"
+            info "Atau copy manual dari server lain"
+            # Create placeholder
+            cat > "$rpz_komdigi" <<'EOF'
+$ORIGIN trustpositifkominfo.
+$TTL 3600
+@       IN      SOA     ns.trustpositifkominfo. admin.trustpositifkominfo. (
+                        2025010100  ; serial
+                        3600    ; refresh
+                        900     ; retry
+                        604800  ; expire
+                        3600 )  ; minimum
+@       IN      NS      localhost.
+EOF
+            ok "Placeholder rpz-komdigi.zone created"
+        fi
+    fi
+
+    # Write recursor.lua
+    [[ -f "$PDNS_LUA" ]] && cp "$PDNS_LUA" "${PDNS_LUA}.bak.$(date +%s)"
+
+    cat > "$PDNS_LUA" <<'EOF'
+dofile("/usr/share/pdns-recursor/lua-config/rootkeys.lua")
+
+-- Local RPZ zone (custom blocklist)
+rpzFile("/var/lib/powerdns/rpz-local.zone", { policyName = "rpz.local" })
+EOF
+
+    if [[ "$rpz_mode" == "1" ]]; then
+        cat >> "$PDNS_LUA" <<'EOF'
+
+-- Komdigi trustpositifkominfo (loaded from zone file)
+rpzFile("/var/lib/powerdns/rpz-komdigi.zone", { policyName = "komdigi" })
+EOF
+    else
+        cat >> "$PDNS_LUA" <<'EOF'
+
+-- Komdigi trustpositifkominfo (AXFR from master)
+rpzPrimary("139.255.196.202", "trustpositifkominfo", { policyName = "komdigi" })
+rpzPrimary("182.23.79.202", "trustpositifkominfo", { policyName = "komdigi" })
+EOF
+    fi
+
+    ok "recursor.lua ditulis"
+
+    # Write query-log.lua
+    cat > "$QUERY_LUA" <<'LUAEOF'
+-- Optimized query logger for PowerDNS Recursor
+-- Persistent file handle, batch flush, atomic rotate
+
+local log_fd = nil
+local write_buf = {}
+local BUF_SIZE = 50
+local MAX_LINES = 200000
+local line_count = 0
+
+local qtype_map = {
+    [1]="A",[28]="AAAA",[5]="CNAME",[15]="MX",
+    [16]="TXT",[2]="NS",[6]="SOA",[12]="PTR",
+    [33]="SRV",[255]="ANY",[257]="CAA",
+}
+
+local function get_fd()
+    if not log_fd then
+        log_fd = io.open("/var/log/pdns-query.log", "a")
+    end
+    return log_fd
+end
+
+function preresolve(dq)
+    local qt = tonumber(dq.qtype)
+    local qts = qtype_map[qt] or tostring(qt)
+    local line = os.date("%Y-%m-%d %H:%M:%S") .. "|"
+                 .. tostring(dq.remoteaddr) .. "|"
+                 .. tostring(dq.qname) .. "|" .. qts
+
+    write_buf[#write_buf + 1] = line
+    line_count = line_count + 1
+
+    if #write_buf >= BUF_SIZE then
+        local fd = get_fd()
+        if fd then
+            fd:write(table.concat(write_buf, "\n") .. "\n")
+            fd:flush()
+        end
+        write_buf = {}
+    end
+
+    if line_count >= MAX_LINES then
+        if log_fd then
+            log_fd:close()
+            log_fd = nil
+        end
+        os.rename("/var/log/pdns-query.log", "/var/log/pdns-query.log.1")
+        line_count = 0
+        write_buf = {}
+    end
+
+    return false
+end
+LUAEOF
+
+    # Touch log file
+    touch "$QUERY_LOG"
+    chown pdns:pdns "$QUERY_LOG" 2>/dev/null || true
+
+    ok "query-log.lua ditulis"
+    ok "Lua configuration selesai"
+}
+
+# ── Step 4: App Deployment ──────────────────────────────────
+
+step_app_deploy() {
+    hr
+    info "STEP 4: RPZ Monitor App Deployment"
+    hr
+
+    # Clone or update repo
+    if [[ -d "$APP_DIR/.git" ]]; then
+        info "Repo sudah ada, pulling latest..."
+        cd "$APP_DIR"
+        git pull --ff-only || warn "Git pull gagal, cek manual"
+    else
+        info "Cloning repo..."
+        if [[ -d "$APP_DIR" ]] && [[ "$(ls -A $APP_DIR 2>/dev/null)" ]]; then
+            warn "Directory $APP_DIR tidak kosong"
+            if confirm "Backup & clone fresh?" "n"; then
+                mv "$APP_DIR" "${APP_DIR}.bak.$(date +%s)"
+                git clone "$GITHUB_REPO" "$APP_DIR"
+            else
+                cd "$APP_DIR"
+                git init 2>/dev/null || true
+                git remote add origin "$GITHUB_REPO" 2>/dev/null || true
+                git fetch origin
+                git checkout -f main
+            fi
+        else
+            git clone "$GITHUB_REPO" "$APP_DIR"
+        fi
+    fi
+
+    cd "$APP_DIR"
+
+    # Python venv
+    info "Creating Python virtual environment..."
+    python3 -m venv venv
+    source venv/bin/activate
+
+    info "Installing dependencies..."
+    pip install --quiet --upgrade pip
+    pip install --quiet -r requirements.txt
+
+    deactivate
+    ok "Python deps installed"
+
+    # .env file
+    if [[ ! -f "$APP_DIR/.env" ]]; then
+        info "Creating .env..."
+        local session_secret
+        session_secret=$(openssl rand -hex 32)
+
+        read -rp "$(echo -e "${YELLOW}Web GUI Username [admin]:${NC} ")" auth_user
+        auth_user="${auth_user:-admin}"
+
+        read -rp "$(echo -e "${YELLOW}Web GUI Password [admin123]:${NC} ")" auth_pass
+        auth_pass="${auth_pass:-admin123}"
+
+        # Read API key from recursor.conf
+        local api_key
+        api_key=$(grep "^api-key=" "$PDNS_CONF" 2>/dev/null | cut -d= -f2 || echo "rpzmonitor2026")
+
+        cat > "$APP_DIR/.env" <<EOF
+# PowerDNS RPZ Monitor
+PDNS_API_URL=http://127.0.0.1:8082
+PDNS_API_KEY=$api_key
+APP_TZ=Asia/Jakarta
+APP_PORT=8050
+AUTH_USER=$auth_user
+AUTH_PASS=$auth_pass
+SESSION_SECRET=$session_secret
+EOF
+        ok ".env created"
+    else
+        info ".env sudah ada, skip"
+    fi
+
+    # Data directory
+    mkdir -p "$APP_DIR/data"
+
+    # Permissions
+    chown -R rpzmon:rpzmon "$APP_DIR"
+
+    ok "App deployment selesai"
+}
+
+# ── Step 5: systemd Service ─────────────────────────────────
+
+step_systemd() {
+    hr
+    info "STEP 5: systemd Service"
+    hr
+
+    # Read creds from .env
+    local auth_user auth_pass
+    auth_user=$(grep "^AUTH_USER=" "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "admin")
+    auth_pass=$(grep "^AUTH_PASS=" "$APP_DIR/.env" 2>/dev/null | cut -d= -f2 || echo "admin123")
+
+    cat > "$SERVICE_FILE" <<EOF
+[Unit]
+Description=PowerDNS RPZ Monitor Web GUI
+After=network.target pdns-recursor.service
+
+[Service]
+Type=simple
+WorkingDirectory=$APP_DIR
+ExecStart=$APP_DIR/venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8050 --log-level info
+Restart=always
+RestartSec=5
+User=rpzmon
+Group=rpzmon
+Environment=PYTHONUNBUFFERED=1
+Environment=AUTH_USER=$auth_user
+Environment=AUTH_PASS=$auth_pass
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+    systemctl daemon-reload
+    systemctl enable rpz-monitor
+    ok "systemd service installed"
+}
+
+# ── Step 6: nginx Config ────────────────────────────────────
+
+step_nginx() {
+    hr
+    info "STEP 6: nginx Reverse Proxy"
+    hr
+
+    local server_name
+    read -rp "$(echo -e "${YELLOW}Server name/domain (contoh: rpz.example.com) [$(hostname)]:${NC} ")" server_name
+    server_name="${server_name:-$(hostname)}"
+
+    cat > "$NGINX_CONF" <<EOF
+server {
+    listen 80;
+    server_name $server_name;
+
+    # Proxy timeouts for heavy endpoints (top-blocked first load)
+    proxy_read_timeout 120s;
+    proxy_connect_timeout 10s;
+    proxy_send_timeout 30s;
+
+    location / {
+        proxy_pass http://127.0.0.1:8050;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    # SSE live logs endpoint
+    location /api/logs/live {
+        proxy_pass http://127.0.0.1:8050;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_buffering off;
+        proxy_cache off;
+        proxy_read_timeout 86400s;
+        chunked_transfer_encoding off;
+    }
+}
+EOF
+
+    # Enable site
+    ln -sf "$NGINX_CONF" "$NGINX_LINK"
+
+    # Remove default site if exists
+    rm -f /etc/nginx/sites-enabled/default 2>/dev/null
+
+    # Test & reload
+    if nginx -t 2>/dev/null; then
+        systemctl reload nginx 2>/dev/null || systemctl restart nginx
+        ok "nginx configured & reloaded"
+    else
+        err "nginx config test failed — cek $NGINX_CONF"
+    fi
+}
+
+# ── Step 7: Start & Verify ──────────────────────────────────
+
+step_verify() {
+    hr
+    info "STEP 7: Start & Verify"
+    hr
+
+    # Start PowerDNS
+    info "Starting PowerDNS Recursor..."
+    systemctl restart pdns-recursor
+    sleep 2
+    if systemctl is-active --quiet pdns-recursor; then
+        ok "pdns-recursor: $(systemctl is-active pdns-recursor)"
+    else
+        err "pdns-recursor gagal start!"
+        journalctl -u pdns-recursor --no-pager -n 20
+    fi
+
+    # Start RPZ Monitor
+    info "Starting RPZ Monitor..."
+    systemctl restart rpz-monitor
+    sleep 2
+    if systemctl is-active --quiet rpz-monitor; then
+        ok "rpz-monitor: $(systemctl is-active rpz-monitor)"
+    else
+        err "rpz-monitor gagal start!"
+        journalctl -u rpz-monitor --no-pager -n 20
+    fi
+
+    # Test DNS
+    info "Testing DNS resolution..."
+    if dig @127.0.0.1 google.com +short +tries=1 +time=3 2>/dev/null | head -1; then
+        ok "DNS query OK"
+    else
+        warn "DNS query failed — mungkin perlu waktu sync zone"
+    fi
+
+    # Test Web GUI
+    info "Testing Web GUI..."
+    local http_code
+    http_code=$(curl -s -o /dev/null -w "%{http_code}" http://127.0.0.1:8050/login 2>/dev/null || echo "000")
+    if [[ "$http_code" == "200" ]]; then
+        ok "Web GUI responding (HTTP $http_code)"
+    else
+        warn "Web GUI HTTP $http_code — cek systemctl status rpz-monitor"
+    fi
+
+    # Test PowerDNS API
+    info "Testing PowerDNS API..."
+    local api_key
+    api_key=$(grep "^api-key=" "$PDNS_CONF" 2>/dev/null | cut -d= -f2 || echo "rpzmonitor2026")
+    local api_code
+    api_code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-API-Key: $api_key" http://127.0.0.1:8082/api/v1/servers/localhost 2>/dev/null || echo "000")
+    if [[ "$api_code" == "200" ]]; then
+        ok "PowerDNS API responding (HTTP $api_code)"
+    else
+        warn "PowerDNS API HTTP $api_code"
+    fi
+
+    hr
+    echo ""
+    ok "Installasi selesai!"
+    echo ""
+    info "Service status:"
+    echo "  pdns-recursor : $(systemctl is-active pdns-recursor)"
+    echo "  rpz-monitor   : $(systemctl is-active rpz-monitor)"
+    echo "  nginx         : $(systemctl is-active nginx)"
+    echo ""
+    info "Akses Web GUI: http://$(hostname -I | awk '{print $1}')/"
+    info "Config files:"
+    echo "  PowerDNS  : $PDNS_CONF"
+    echo "  Lua RPZ   : $PDNS_LUA"
+    echo "  Query Log : $QUERY_LUA"
+    echo "  App       : $APP_DIR/"
+    echo "  .env      : $APP_DIR/.env"
+    echo "  systemd   : $SERVICE_FILE"
+    echo "  nginx     : $NGINX_CONF"
+    echo ""
+    info "Logs:"
+    echo "  journalctl -u pdns-recursor -f"
+    echo "  journalctl -u rpz-monitor -f"
+    echo "  tail -f $QUERY_LOG"
+    echo ""
+}
+
+# ── Menu ─────────────────────────────────────────────────────
+
+show_menu() {
+    clear
+    echo -e "${CYAN}${BOLD}"
+    echo "  ╔══════════════════════════════════════════════╗"
+    echo "  ║     PowerDNS RPZ Monitor — Installer        ║"
+    echo "  ║     enowX Labs                               ║"
+    echo "  ╚══════════════════════════════════════════════╝"
+    echo -e "${NC}"
+    echo "  Pilih opsi install:"
+    echo ""
+    echo -e "  ${GREEN}1)${NC} Full Install (semua steps)"
+    echo ""
+    echo -e "  ${YELLOW}── Step by Step ──${NC}"
+    echo -e "  ${CYAN}2)${NC}  System Preparation (packages, user, dirs)"
+    echo -e "  ${CYAN}3)${NC}  PowerDNS Recursor Config"
+    echo -e "  ${CYAN}4)${NC}  Lua RPZ + Query Log Config"
+    echo -e "  ${CYAN}5)${NC}  App Deploy (clone, venv, .env)"
+    echo -e "  ${CYAN}6)${NC}  systemd Service"
+    echo -e "  ${CYAN}7)${NC}  nginx Reverse Proxy"
+    echo -e "  ${CYAN}8)${NC}  Start & Verify"
+    echo ""
+    echo -e "  ${YELLOW}── Utilities ──${NC}"
+    echo -e "  ${CYAN}9)${NC}  Check Status (semua service)"
+    echo -e "  ${CYAN}10)${NC} Fetch Komdigi RPZ Zone (AXFR)"
+    echo -e "  ${CYAN}11)${NC} View Logs"
+    echo ""
+    echo -e "  ${RED}0)${NC} Exit"
+    echo ""
+}
+
+check_status() {
+    hr
+    info "Service Status"
+    hr
+    echo ""
+    for svc in pdns-recursor rpz-monitor nginx; do
+        local status
+        status=$(systemctl is-active "$svc" 2>/dev/null || echo "not-found")
+        if [[ "$status" == "active" ]]; then
+            echo -e "  $svc : ${GREEN}$status${NC}"
+        else
+            echo -e "  $svc : ${RED}$status${NC}"
+        fi
+    done
+    echo ""
+
+    # Disk usage
+    info "Disk usage:"
+    echo "  App dir: $(du -sh "$APP_DIR" 2>/dev/null | awk '{print $1}' || echo 'N/A')"
+    echo "  RPZ zone: $(ls -lh /var/lib/powerdns/rpz-komdigi.zone 2>/dev/null | awk '{print $5}' || echo 'not found')"
+    echo "  Query log: $(ls -lh "$QUERY_LOG" 2>/dev/null | awk '{print $5}' || echo 'not found')"
+    echo ""
+
+    # Memory
+    info "Memory (pdns-recursor):"
+    ps -o pid,rss,vsz,comm -C pdns_recursor 2>/dev/null || echo "  pdns_recursor not running"
+    echo ""
+}
+
+fetch_komdigi_zone() {
+    hr
+    info "Fetch Komdigi RPZ Zone via AXFR"
+    hr
+    echo ""
+    info "Testing AXFR from Komdigi masters..."
+    echo ""
+
+    local zone_file="/var/lib/powerdns/rpz-komdigi.zone"
+    local tmp_axfr="/tmp/komdigi-rpz.axfr"
+    local success=0
+
+    for master in "182.23.79.202" "139.255.196.202"; do
+        info "Trying AXFR from $master..."
+        if dig AXFR @"$master" trustpositifkominfo +noidnout +time=120 > "$tmp_axfr" 2>/dev/null; then
+            local lines
+            lines=$(wc -l < "$tmp_axfr")
+            if [[ "$lines" -gt 10 ]]; then
+                ok "AXFR success from $master ($lines lines)"
+                success=1
+                break
+            else
+                warn "AXFR returned only $lines lines — likely failed/SERVFAIL"
+            fi
+        else
+            warn "AXFR failed from $master"
+        fi
+    done
+
+    if [[ "$success" -eq 1 ]]; then
+        info "Converting to rpzFile format..."
+
+        # Build proper zone file for rpzFile()
+        {
+            echo '$ORIGIN trustpositifkominfo.'
+            echo '$TTL 3600'
+            # Extract SOA from AXFR, rewrite owner
+            grep -m1 "^trustpositifkominfo.*SOA" "$tmp_axfr" || echo "@       IN      SOA     ns.trustpositifkominfo. admin.trustpositifkominfo. ($(date +%Y%m%d%H) 3600 900 604800 3600)"
+            # Extract all records except SOA/NS at origin
+            grep -v "^trustpositifkominfo.*SOA" "$tmp_axfr" | \
+            grep -v "^trustpositifkominfo.*NS" | \
+            grep -v "^;" | \
+            sed 's/^trustpositifkominfo\./@       /'
+        } > "${zone_file}.tmp"
+
+        local new_lines
+        new_lines=$(wc -l < "${zone_file}.tmp")
+        if [[ "$new_lines" -gt 100 ]]; then
+            mv "${zone_file}.tmp" "$zone_file"
+            ok "Zone file updated: $zone_file ($new_lines records)"
+
+            if confirm "Restart pdns-recursor to load new zone?" "y"; then
+                systemctl restart pdns-recursor
+                ok "pdns-recursor restarted"
+            fi
+        else
+            err "Zone file conversion failed ($new_lines lines)"
+            rm -f "${zone_file}.tmp"
+        fi
+    else
+        err "AXFR gagal dari semua master"
+        info "Kemungkinan:"
+        echo "  - IP server belum di-register di https://integrasipenapisan.komdigi.go.id"
+        echo "  - Approval belum selesai (bisa sampai 1x24 jam)"
+        echo "  - Master Komdigi sedang down"
+    fi
+
+    rm -f "$tmp_axfr"
+    pause
+}
+
+view_logs() {
+    hr
+    info "View Logs"
+    hr
+    echo ""
+    echo "  1) pdns-recursor (last 50 lines)"
+    echo "  2) rpz-monitor   (last 50 lines)"
+    echo "  3) Query log     (last 50 lines)"
+    echo "  4) nginx error   (last 50 lines)"
+    echo ""
+    read -rp "Pilih [1]: " log_choice
+    log_choice="${log_choice:-1}"
+
+    case "$log_choice" in
+        1) journalctl -u pdns-recursor --no-pager -n 50 ;;
+        2) journalctl -u rpz-monitor --no-pager -n 50 ;;
+        3) tail -50 "$QUERY_LOG" 2>/dev/null || echo "Query log not found" ;;
+        4) tail -50 /var/log/nginx/error.log 2>/dev/null || echo "Nginx error log not found" ;;
+        *) warn "Invalid choice" ;;
+    esac
+    pause
+}
+
+# ── Main ─────────────────────────────────────────────────────
+
+main() {
+    require_root
+    check_os
+
+    while true; do
+        show_menu
+        read -rp "Pilih opsi: " choice
+
+        case "$choice" in
+            1)
+                step_system_prep
+                step_pdns_config
+                step_lua_config
+                step_app_deploy
+                step_systemd
+                step_nginx
+                step_verify
+                pause
+                ;;
+            2) step_system_prep; pause ;;
+            3) step_pdns_config; pause ;;
+            4) step_lua_config; pause ;;
+            5) step_app_deploy; pause ;;
+            6) step_systemd; pause ;;
+            7) step_nginx; pause ;;
+            8) step_verify; pause ;;
+            9) check_status; pause ;;
+            10) fetch_komdigi_zone ;;
+            11) view_logs ;;
+            0)
+                echo ""
+                ok "Bye!"
+                exit 0
+                ;;
+            *)
+                warn "Opsi tidak valid"
+                sleep 1
+                ;;
+        esac
+    done
+}
+
+main "$@"
