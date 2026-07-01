@@ -64,13 +64,14 @@ Menu installer:
   3) PowerDNS Recursor Config
   4) Lua RPZ + Query Log Config
   5) App Deploy (clone, venv, .env)
-  6) systemd Service
-  7) nginx Reverse Proxy
-  8) Start & Verify
+  6) Fetch Komdigi Zone + Auto-Sync Cron
+  7) systemd Service
+  8) nginx Reverse Proxy
+  9) Start & Verify
 
-  9)  Check Status
-  10) Fetch Komdigi RPZ Zone (AXFR)
-  11) View Logs
+  10) Check Status
+  11) Fetch Komdigi RPZ Zone (AXFR)
+  12) View Logs
 ```
 
 Installer handle:
@@ -80,6 +81,8 @@ Installer handle:
 - Pilih mode Komdigi: rpzFile (manual) atau rpzPrimary (AXFR)
 - Lua configs: recursor.lua + query-log.lua (optimized batch flush)
 - Clone repo, buat venv, pip install, generate .env
+- **Auto-fetch Komdigi zone** via AXFR saat install (jika IP sudah di-approve)
+- **Cron auto-sync** 3x/hari (03:00, 11:00, 19:00 WIB) dengan 20x retry
 - systemd service (runs as `rpzmon` user, bukan root)
 - nginx reverse proxy + SSE endpoint (buffering off)
 - Fetch Komdigi zone via AXFR (utility menu)
