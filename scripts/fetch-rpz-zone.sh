@@ -13,6 +13,7 @@ MASTERS=("182.23.79.202" "139.255.196.202")
 AXFR_TMP="/tmp/komdigi-rpz.axfr"
 MAX_RETRY=20
 RETRY_INTERVAL=5
+ORIGIN="trustpositifkominfo"
 
 log() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE"
@@ -30,7 +31,7 @@ for attempt in $(seq 1 $MAX_RETRY); do
     for master in "${MASTERS[@]}"; do
         log "Attempt $attempt/$MAX_RETRY — AXFR from $master"
 
-        if dig AXFR @"$master" trustpositifkominfo +noidnout +time=120 > "$AXFR_TMP" 2>/dev/null; then
+        if dig AXFR @"$master" "$ORIGIN" +noidnout +time=120 > "$AXFR_TMP" 2>/dev/null; then
             lines=$(wc -l < "$AXFR_TMP")
             if [[ "$lines" -gt 100 ]]; then
                 log "AXFR success from $master — $lines lines"
@@ -57,23 +58,54 @@ if [[ "$success" -eq 0 ]]; then
 fi
 
 # Convert AXFR to rpzFile format
+# Key: strip zone origin suffix so $ORIGIN handles it
 log "Converting zone format..."
 
+ORIGIN_ESC="${ORIGIN//./\\.}"
+
 {
-    # SOA with proper owner
-    grep -m1 "^trustpositifkominfo\..*SOA" "$AXFR_TMP" | sed 's/^trustpositifkominfo\./@       /'
-    # NS records
-    grep "^trustpositifkominfo\..*NS" "$AXFR_TMP" | sed 's/^trustpositifkominfo\./@       /'
-    # All other records (skip SOA/NS at origin, skip comments)
-    grep -v "^trustpositifkominfo\..*\(SOA\|NS\)" "$AXFR_TMP" | \
-    grep -v "^;" | \
+    # Zone header
+    echo "\$ORIGIN ${ORIGIN}."
+    echo "\$TTL 3600"
+
+    # Process AXFR output:
+    # 1. Skip comment lines
+    # 2. Strip origin suffix from owner names (convert FQDN to relative)
+    # 3. Skip SOA and NS at zone apex (we write our own)
+    grep -v "^;" "$AXFR_TMP" | \
     grep -v "^$" | \
-    sed 's/^trustpositifkominfo\./@       /'
+    grep -viE "^\S+\s+\d+\s+IN\s+(SOA|NS)\s+" | \
+    sed -E "s/^([^ ]+)\.${ORIGIN_ESC}\./\1/" | \
+    sed -E "s/^${ORIGIN_ESC}\./@/"
 } > "$ZONE_TMP"
+
+# Add SOA and NS at the top (after header)
+# Merge: header + SOA + NS + records
+{
+    echo "\$ORIGIN ${ORIGIN}."
+    echo "\$TTL 3600"
+    echo "@       IN      SOA     ns.${ORIGIN}. admin.${ORIGIN}. ("
+    echo "                        $(date +%Y%m%d%H)  ; serial"
+    echo "                        3600    ; refresh"
+    echo "                        900     ; retry"
+    echo "                        604800  ; expire"
+    echo "                        3600 )  ; minimum"
+    echo "@       IN      NS      localhost."
+    echo ""
+    # Domain records (already converted above, skip header lines from ZONE_TMP)
+    grep -v '^\$' "$ZONE_TMP" | grep -v "^@"
+} > "${ZONE_TMP}.final"
+
+mv "${ZONE_TMP}.final" "$ZONE_TMP"
 
 # Validate
 new_lines=$(wc -l < "$ZONE_TMP")
 new_size=$(du -h "$ZONE_TMP" | awk '{print $1}')
+
+# Sample check: verify records look correct
+sample=$(grep -m3 "CNAME\|A " "$ZONE_TMP" | head -3)
+log "Sample records:"
+log "$sample"
 
 if [[ "$new_lines" -gt 100 ]]; then
     # Backup old zone
@@ -95,6 +127,14 @@ if [[ "$new_lines" -gt 100 ]]; then
         sleep 3
         if systemctl is-active --quiet pdns-recursor; then
             log "pdns-recursor active — zone loaded"
+
+            # Quick RPZ test
+            test_result=$(dig @127.0.0.1 xnxx.com +short +tries=1 +time=3 2>/dev/null | head -1)
+            if [[ -z "$test_result" ]] || [[ "$test_result" == *"139.255"* ]] || [[ "$test_result" == *"182.23"* ]]; then
+                log "RPZ test: xnxx.com BLOCKED (expected)"
+            else
+                log "RPZ test: xnxx.com NOT blocked — check zone format!"
+            fi
         else
             log "ERROR: pdns-recursor failed to start after restart!"
             journalctl -u pdns-recursor --no-pager -n 10 >> "$LOG_FILE" 2>&1
