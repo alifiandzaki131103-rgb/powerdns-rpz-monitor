@@ -167,7 +167,7 @@ allow-from=$default_allow
 webserver=yes
 webserver-address=0.0.0.0
 webserver-port=8082
-webserver-allow-from=0.0.0.0/0
+webserver-allow-from=127.0.0.1/32
 webserver-password=$web_pass
 api-key=$api_key
 
@@ -214,11 +214,8 @@ step_lua_config() {
     hr
 
     echo ""
-    info "Pilih mode sync Komdigi RPZ:"
-    echo "  1) rpzFile   — load dari file lokal (stabil, perlu fetch manual/periodic)"
-    echo "  2) rpzPrimary — AXFR langsung dari master Komdigi (butuh approval IP)"
-    read -rp "$(echo -e "${YELLOW}Pilih [1]:${NC} ")" rpz_mode
-    rpz_mode="${rpz_mode:-1}"
+    info "Komdigi RPZ: rpzFile mode (load dari zone file lokal)"
+    info "Zone akan di-fetch oleh cron auto-sync (fetch-rpz-zone.sh)"
 
     # Local RPZ zone
     if [[ ! -f "$RPZ_LOCAL" ]]; then
@@ -240,13 +237,10 @@ EOF
         info "rpz-local.zone sudah ada, skip"
     fi
 
-    # Komdigi zone file (if rpzFile mode)
-    if [[ "$rpz_mode" == "1" ]]; then
-        local rpz_komdigi="/var/lib/powerdns/rpz-komdigi.zone"
-        if [[ ! -f "$rpz_komdigi" ]]; then
-            info "rpz-komdigi.zone belum ada — attempting AXFR fetch..."
-            # Will be fetched after app deploy (step 4b)
-        fi
+    # Komdigi zone file check
+    local rpz_komdigi="/var/lib/powerdns/rpz-komdigi.zone"
+    if [[ ! -f "$rpz_komdigi" ]]; then
+        info "rpz-komdigi.zone belum ada — akan di-fetch setelah deploy (step 6)"
     fi
 
     # Write recursor.lua
@@ -259,20 +253,11 @@ dofile("/usr/share/pdns-recursor/lua-config/rootkeys.lua")
 rpzFile("/var/lib/powerdns/rpz-local.zone", { policyName = "rpz.local" })
 EOF
 
-    if [[ "$rpz_mode" == "1" ]]; then
-        cat >> "$PDNS_LUA" <<'EOF'
+    cat >> "$PDNS_LUA" <<'EOF'
 
--- Komdigi trustpositifkominfo (loaded from zone file)
+# Komdigi trustpositifkominfo (loaded from zone file, updated by cron)
 rpzFile("/var/lib/powerdns/rpz-komdigi.zone", { policyName = "komdigi" })
 EOF
-    else
-        cat >> "$PDNS_LUA" <<'EOF'
-
--- Komdigi trustpositifkominfo (AXFR from master)
-rpzPrimary("139.255.196.202", "trustpositifkominfo", { policyName = "komdigi" })
-rpzPrimary("182.23.79.202", "trustpositifkominfo", { policyName = "komdigi" })
-EOF
-    fi
 
     ok "recursor.lua ditulis"
 
