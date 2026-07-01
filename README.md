@@ -35,7 +35,53 @@ Web GUI monitoring untuk PowerDNS Recursor dengan RPZ (Response Policy Zone) Kom
 - Python 3.12+
 - Query logging aktif via Lua `preresolve` hook
 
-## Install
+## Quick Install (Recommended)
+
+Interactive installer — bisa full install atau step-by-step:
+
+```bash
+curl -sL https://raw.githubusercontent.com/alifiandzaki131103-rgb/powerdns-rpz-monitor/main/scripts/install.sh | bash
+```
+
+Atau clone dulu:
+
+```bash
+git clone https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor.git
+cd powerdns-rpz-monitor
+bash scripts/install.sh
+```
+
+Menu installer:
+
+```
+  1) Full Install (semua steps)
+
+  2) System Preparation (packages, user, dirs)
+  3) PowerDNS Recursor Config
+  4) Lua RPZ + Query Log Config
+  5) App Deploy (clone, venv, .env)
+  6) systemd Service
+  7) nginx Reverse Proxy
+  8) Start & Verify
+
+  9)  Check Status
+  10) Fetch Komdigi RPZ Zone (AXFR)
+  11) View Logs
+```
+
+Installer handle:
+- Disable systemd-resolved + fix resolv.conf
+- Install pdns-recursor, nginx, python3-venv, dnsutils
+- Interactive config: allow-from subnet, API key, password, threads
+- Pilih mode Komdigi: rpzFile (manual) atau rpzPrimary (AXFR)
+- Lua configs: recursor.lua + query-log.lua (optimized batch flush)
+- Clone repo, buat venv, pip install, generate .env
+- systemd service (runs as `rpzmon` user, bukan root)
+- nginx reverse proxy + SSE endpoint (buffering off)
+- Fetch Komdigi zone via AXFR (utility menu)
+- Full verification: service status, DNS test, web GUI, API
+
+## Manual Install
 
 ### 1. PowerDNS Recursor Setup
 
@@ -189,10 +235,17 @@ dig AXFR @182.23.79.202 trustpositifkominfo +noidnout +time=120 > /tmp/rpz.axfr
 # Convert ke PowerDNS format dan simpan ke /var/lib/powerdns/rpz-komdigi.zone
 ```
 
+Atau pakai menu installer (opsi 10):
+
+```bash
+bash scripts/install.sh
+# → pilih 10) Fetch Komdigi RPZ Zone (AXFR)
+```
+
 ### 3. Web GUI Install
 
 ```bash
-git clone https://github.com/Alifian13/powerdns-rpz-monitor.git /opt/rpz-monitor
+git clone https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor.git /opt/rpz-monitor
 cd /opt/rpz-monitor
 
 # Python venv
@@ -214,8 +267,13 @@ python -m uvicorn app.main:app --host 0.0.0.0 --port 8050
 ### 4. Systemd Service
 
 ```bash
+# Service user (non-root)
+useradd --system --home /opt/rpz-monitor --shell /usr/sbin/nologin rpzmon
+usermod -aG pdns rpzmon
+chown -R rpzmon:rpzmon /opt/rpz-monitor
+
 cp systemd/rpz-monitor.service /etc/systemd/system/
-# Edit Environment= di service file jika tidak pakai .env
+# Edit Environment= AUTH_USER & AUTH_PASS di service file
 systemctl daemon-reload
 systemctl enable rpz-monitor
 systemctl start rpz-monitor
@@ -260,6 +318,46 @@ nginx -t && systemctl reload nginx
                     └──────────────────┘
 ```
 
+## Project Structure
+
+```
+/opt/rpz-monitor/
+├── app/
+│   ├── main.py              # FastAPI app + routes
+│   ├── auth.py              # HMAC session auth
+│   ├── config.py            # Config loader
+│   ├── database.py          # SQLite helpers
+│   ├── cdn_analytics.py     # CDN/app parser + DB
+│   ├── top_blocked.py       # Top blocked domains
+│   ├── resources.py         # System resource collector
+│   ├── query_log.py         # Query log reader
+│   ├── services/
+│   │   └── ...
+│   └── templates/
+│       ├── base.html
+│       ├── dashboard.html
+│       ├── rpz_status.html
+│       ├── domain_check.html
+│       ├── logs.html
+│       ├── cdn.html
+│       └── ...
+├── data/
+│   └── rpz-monitor.db       # SQLite (auto-created)
+├── scripts/
+│   ├── install.sh           # ← Interactive installer
+│   ├── deploy.sh            # Git push + SSH deploy
+│   ├── query-log.lua        # Optimized Lua query logger
+│   ├── recursor.conf.example
+│   └── recursor.lua.example
+├── systemd/
+│   └── rpz-monitor.service
+├── nginx/
+│   └── rpz-monitor.conf
+├── requirements.txt
+├── .env.example
+└── .env                     # Local config (git-ignored)
+```
+
 ## API Endpoints
 
 | Endpoint | Method | Description |
@@ -269,10 +367,15 @@ nginx -t && systemctl reload nginx
 | `/check` | GET/POST | Domain checker |
 | `/logs` | GET | Query log viewer |
 | `/cdn` | GET | CDN analytics |
+| `/resources` | GET | Resource monitor |
+| `/top-blocked` | GET | Top blocked domains |
 | `/api/stats` | GET | JSON stats |
 | `/api/cdn?range=1d` | GET | JSON CDN data (1h/1d/7d/30d) |
 | `/api/logs` | GET | JSON query logs |
+| `/api/logs/live` | GET | SSE live log stream |
 | `/api/rpz/zones` | GET | JSON RPZ zone info |
+| `/api/resources` | GET | JSON resource data |
+| `/api/top-blocked` | GET | JSON top blocked domains |
 
 ## CDN Analytics
 
