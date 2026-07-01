@@ -21,6 +21,8 @@ NGINX_CONF="/etc/nginx/sites-available/rpz-monitor"
 NGINX_LINK="/etc/nginx/sites-enabled/rpz-monitor"
 RPZ_LOCAL="/var/lib/powerdns/rpz-local.zone"
 QUERY_LOG="/var/log/pdns-query.log"
+FETCH_SCRIPT="/opt/rpz-monitor/scripts/fetch-rpz-zone.sh"
+CRON_LOG="/var/log/rpz-fetch.log"
 
 GITHUB_REPO="https://github.com/alifiandzaki131103-rgb/powerdns-rpz-monitor.git"
 
@@ -221,11 +223,12 @@ step_lua_config() {
     # Local RPZ zone
     if [[ ! -f "$RPZ_LOCAL" ]]; then
         info "Membuat rpz-local.zone kosong..."
-        cat > "$RPZ_LOCAL" <<'EOF'
-$ORIGIN rpz.local.
-$TTL 3600
+        serial=$(date +%Y%m%d%H)
+        cat > "$RPZ_LOCAL" <<EOF
+\$ORIGIN rpz.local.
+\$TTL 3600
 @       IN      SOA     ns.rpz.local. admin.rpz.local. (
-                        $(date +%Y%m%d%H)  ; serial
+                        $serial  ; serial
                         3600    ; refresh
                         900     ; retry
                         604800  ; expire
@@ -241,22 +244,8 @@ EOF
     if [[ "$rpz_mode" == "1" ]]; then
         local rpz_komdigi="/var/lib/powerdns/rpz-komdigi.zone"
         if [[ ! -f "$rpz_komdigi" ]]; then
-            warn "rpz-komdigi.zone belum ada di $rpz_komdigi"
-            info "Jalankan fetch-rpz-zone.sh setelah install untuk download zone dari master Komdigi"
-            info "Atau copy manual dari server lain"
-            # Create placeholder
-            cat > "$rpz_komdigi" <<'EOF'
-$ORIGIN trustpositifkominfo.
-$TTL 3600
-@       IN      SOA     ns.trustpositifkominfo. admin.trustpositifkominfo. (
-                        2025010100  ; serial
-                        3600    ; refresh
-                        900     ; retry
-                        604800  ; expire
-                        3600 )  ; minimum
-@       IN      NS      localhost.
-EOF
-            ok "Placeholder rpz-komdigi.zone created"
+            info "rpz-komdigi.zone belum ada — attempting AXFR fetch..."
+            # Will be fetched after app deploy (step 4b)
         fi
     fi
 
@@ -435,6 +424,64 @@ EOF
     chown -R rpzmon:rpzmon "$APP_DIR"
 
     ok "App deployment selesai"
+}
+
+# ── Step 4b: Fetch Script + Cron + Auto-Fetch ───────────────
+
+step_fetch_setup() {
+    hr
+    info "STEP 4b: Komdigi Zone Fetch + Auto-Sync"
+    hr
+
+    # Copy fetch script from repo to persistent location
+    mkdir -p "$APP_DIR/scripts"
+    if [[ -f "$APP_DIR/scripts/fetch-rpz-zone.sh" ]]; then
+        cp "$APP_DIR/scripts/fetch-rpz-zone.sh" "$FETCH_SCRIPT"
+    else
+        warn "fetch-rpz-zone.sh not found in repo — creating inline"
+        # Script will be created by the repo clone; if missing, skip
+    fi
+    chmod +x "$FETCH_SCRIPT"
+    ok "Fetch script installed: $FETCH_SCRIPT"
+
+    # Auto-fetch zone now if rpzFile mode and zone missing/small
+    local rpz_komdigi="/var/lib/powerdns/rpz-komdigi.zone"
+    local need_fetch=0
+    if [[ ! -f "$rpz_komdigi" ]]; then
+        need_fetch=1
+    else
+        local line_count
+        line_count=$(wc -l < "$rpz_komdigi")
+        if [[ "$line_count" -lt 100 ]]; then
+            need_fetch=1
+        fi
+    fi
+
+    if [[ "$need_fetch" -eq 1 ]]; then
+        info "Zone file missing or placeholder — attempting auto-fetch..."
+        if [[ -x "$FETCH_SCRIPT" ]]; then
+            bash "$FETCH_SCRIPT" 2>&1 | tail -10
+        else
+            warn "Fetch script not available — run manually: bash $FETCH_SCRIPT"
+        fi
+    else
+        ok "Zone file exists ($(wc -l < "$rpz_komdigi") lines)"
+    fi
+
+    # Setup cron for auto-sync (3x/day)
+    if confirm "Setup cron auto-sync (03:00, 11:00, 19:00 WIB)?" "y"; then
+        local cron_line="0 3,11,19 * * * /bin/bash $FETCH_SCRIPT >> $CRON_LOG 2>&1"
+
+        # Add cron if not exists
+        if crontab -l 2>/dev/null | grep -q "fetch-rpz-zone"; then
+            info "Cron already exists, skip"
+        else
+            (crontab -l 2>/dev/null; echo "$cron_line") | crontab -
+            ok "Cron added: 03:00, 11:00, 19:00 WIB"
+        fi
+    fi
+
+    ok "Fetch setup selesai"
 }
 
 # ── Step 5: systemd Service ─────────────────────────────────
@@ -636,14 +683,15 @@ show_menu() {
     echo -e "  ${CYAN}3)${NC}  PowerDNS Recursor Config"
     echo -e "  ${CYAN}4)${NC}  Lua RPZ + Query Log Config"
     echo -e "  ${CYAN}5)${NC}  App Deploy (clone, venv, .env)"
-    echo -e "  ${CYAN}6)${NC}  systemd Service"
-    echo -e "  ${CYAN}7)${NC}  nginx Reverse Proxy"
-    echo -e "  ${CYAN}8)${NC}  Start & Verify"
+    echo -e "  ${CYAN}6)${NC}  Fetch Komdigi Zone + Auto-Sync Cron"
+    echo -e "  ${CYAN}7)${NC}  systemd Service"
+    echo -e "  ${CYAN}8)${NC}  nginx Reverse Proxy"
+    echo -e "  ${CYAN}9)${NC}  Start & Verify"
     echo ""
     echo -e "  ${YELLOW}── Utilities ──${NC}"
-    echo -e "  ${CYAN}9)${NC}  Check Status (semua service)"
-    echo -e "  ${CYAN}10)${NC} Fetch Komdigi RPZ Zone (AXFR)"
-    echo -e "  ${CYAN}11)${NC} View Logs"
+    echo -e "  ${CYAN}10)${NC} Check Status (semua service)"
+    echo -e "  ${CYAN}11)${NC} Fetch Komdigi RPZ Zone (AXFR)"
+    echo -e "  ${CYAN}12)${NC} View Logs"
     echo ""
     echo -e "  ${RED}0)${NC} Exit"
     echo ""
@@ -788,6 +836,7 @@ main() {
                 step_pdns_config
                 step_lua_config
                 step_app_deploy
+                step_fetch_setup
                 step_systemd
                 step_nginx
                 step_verify
@@ -797,12 +846,13 @@ main() {
             3) step_pdns_config; pause ;;
             4) step_lua_config; pause ;;
             5) step_app_deploy; pause ;;
-            6) step_systemd; pause ;;
-            7) step_nginx; pause ;;
-            8) step_verify; pause ;;
-            9) check_status; pause ;;
-            10) fetch_komdigi_zone ;;
-            11) view_logs ;;
+            6) step_fetch_setup; pause ;;
+            7) step_systemd; pause ;;
+            8) step_nginx; pause ;;
+            9) step_verify; pause ;;
+            10) check_status; pause ;;
+            11) fetch_komdigi_zone ;;
+            12) view_logs ;;
             0)
                 echo ""
                 ok "Bye!"
